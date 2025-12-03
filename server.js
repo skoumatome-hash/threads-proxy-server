@@ -9,7 +9,9 @@ app.use(express.json());
 const requestQueue = [];
 let isProcessing = false;
 
-// Cookie値の抽出
+// ---------------------------------------------------------
+//  Cookie値の抽出
+// ---------------------------------------------------------
 function getCookieValue(cookieString, key) {
   if (!cookieString) return null;
   const match = cookieString.match(new RegExp('(^|;\\s*)' + key + '=([^;]*)'));
@@ -17,7 +19,9 @@ function getCookieValue(cookieString, key) {
   return null;
 }
 
-// プロキシ形式変換
+// ---------------------------------------------------------
+//  プロキシ形式変換
+// ---------------------------------------------------------
 function formatProxy(proxyStr) {
   if (!proxyStr) return null;
   if (proxyStr.startsWith("http")) return proxyStr;
@@ -29,13 +33,15 @@ function formatProxy(proxyStr) {
   return proxyStr;
 }
 
-// 共通ヘッダー生成関数 (成功した設定をここ一箇所で作る)
+// ---------------------------------------------------------
+//  ブラウザ偽装ヘッダー作成 (成功実績あり)
+// ---------------------------------------------------------
 function createBrowserHeaders(ua, fullCookie, csrftoken) {
   return {
     'User-Agent': ua,
     'Cookie': fullCookie,
     'x-csrftoken': csrftoken,
-    'x-ig-app-id': '238260118697367', // ★これが超重要！WebブラウザのID
+    'x-ig-app-id': '238260118697367', // WebブラウザのAppID
     'x-asbd-id': '129477',
     'Authority': 'www.threads.net',
     'Accept': '*/*',
@@ -49,7 +55,7 @@ function createBrowserHeaders(ua, fullCookie, csrftoken) {
   };
 }
 
-// 1. ログイン確認
+// 1. ログイン確認 (兼 接続テスト)
 app.post("/api/check", async (req, res) => {
   const { username, fullCookie, ua, proxy } = req.body;
   console.log(`[Login Check] ${username}`);
@@ -57,11 +63,10 @@ app.post("/api/check", async (req, res) => {
   if (!proxy || !fullCookie) return res.status(400).json({ status: "error", message: "情報不足" });
 
   try {
+    // 生通信でチェック (ライブラリのバグ回避)
     const formattedProxy = formatProxy(proxy);
     const proxyAgent = new HttpsProxyAgent(formattedProxy);
     const realCsrf = getCookieValue(fullCookie, "csrftoken");
-
-    // 成功実績のあるヘッダーを使用
     const headers = createBrowserHeaders(ua, fullCookie, realCsrf);
 
     const targetUrl = `https://www.threads.net/@${username}`;
@@ -72,12 +77,8 @@ app.post("/api/check", async (req, res) => {
       validateStatus: status => status < 500
     });
 
-    console.log(`Check Response: ${response.status}`);
-
     if (response.status === 200) {
-      res.json({ status: "success", message: "★ログイン確認よし！ (Web ID一致)" });
-    } else if (response.status === 404) {
-      res.status(404).json({ status: "error", message: "ページが見つかりません (404)" });
+      res.json({ status: "success", message: "★接続OK！ (Webとして認識されました)" });
     } else {
       res.status(response.status).json({ status: "error", message: `ステータス異常: ${response.status}` });
     }
@@ -90,14 +91,15 @@ app.post("/api/check", async (req, res) => {
 
 // 2. 予約受付
 app.post("/api/enqueue", (req, res) => {
+  // 必要な情報を全部受け取ってキューに入れる
   const { username, fullCookie, text, deviceId, imageUrl, ua, proxy } = req.body;
   requestQueue.push({ username, fullCookie, text, deviceId, imageUrl, ua, proxy });
-  console.log(`[受付] ${username}`);
+  console.log(`[受付] ${username} を予約`);
   res.json({ status: "queued", message: "予約完了" });
   processQueue();
 });
 
-// 3. 処理ワーカー
+// 3. 処理ワーカー (ログイン → 即投稿)
 async function processQueue() {
   if (isProcessing || requestQueue.length === 0) return;
   isProcessing = true;
@@ -114,21 +116,31 @@ async function processQueue() {
       const realCsrf = getCookieValue(task.fullCookie, "csrftoken");
       const realDeviceId = getCookieValue(task.fullCookie, "ig_did") || task.deviceId;
 
-      // ★成功した「Webブラウザ用ヘッダー」を作成
-      const browserHeaders = createBrowserHeaders(task.ua, task.fullCookie, realCsrf);
-
+      // 1. クライアント作成
       const threadsAPI = new ThreadsAPI({
         username: task.username,
         token: sessionid,
         deviceID: realDeviceId,
+        // ここでの設定は初期値として渡す
         axiosConfig: { 
           httpAgent: proxyAgent, 
           httpsAgent: proxyAgent,
-          headers: browserHeaders // ★これをライブラリに強制注入
         },
       });
 
+      // ★重要: ライブラリが勝手にヘッダーを変えないよう、送信直前に「検問」で書き換える
+      const browserHeaders = createBrowserHeaders(task.ua, task.fullCookie, realCsrf);
+      
+      threadsAPI.axios.interceptors.request.use(config => {
+        // ヘッダーを強制上書き
+        Object.assign(config.headers, browserHeaders);
+        return config;
+      });
+
+      // 2. 「ログインした状態」で投稿を実行
+      console.log("投稿リクエスト送信...");
       await threadsAPI.publish({ text: task.text, image: task.imageUrl });
+      
       console.log(`✅ 投稿成功: ${task.username}`);
 
     } catch (error) {
@@ -138,6 +150,7 @@ async function processQueue() {
       }
     }
 
+    // 休憩 (IPローテ対策)
     if (requestQueue.length > 0) {
       console.log("☕ 休憩中 (25秒)...");
       await new Promise((resolve) => setTimeout(resolve, 25000));
