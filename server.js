@@ -20,23 +20,21 @@ app.post("/api/check", async (req, res) => {
   try {
     const proxyAgent = new HttpsProxyAgent(PROXY_URL);
     
-    // ヘッダーを準備
-    const headers = {};
-    if (csrftoken) {
-      headers['x-csrftoken'] = csrftoken;
-      // Cookieにcsrftokenを追加（sessionidはライブラリが自動でtokenからセットします）
-      headers['Cookie'] = `csrftoken=${csrftoken}`;
-    }
+    // ★修正: Cookieを合体させる
+    // sessionid と csrftoken を両方とも1つの文字列にする
+    const cookieString = `sessionid=${token}; csrftoken=${csrftoken}`;
 
     const threadsAPI = new ThreadsAPI({
       username: username,
       token: token, 
       deviceID: deviceId,
-      // ★修正: ここでヘッダーを渡す
       axiosConfig: { 
         httpAgent: proxyAgent, 
         httpsAgent: proxyAgent,
-        headers: headers 
+        headers: {
+          'x-csrftoken': csrftoken,
+          'Cookie': cookieString // ★ここが修正ポイント！上書きせず合体版を渡す
+        }
       },
     });
 
@@ -70,14 +68,9 @@ async function processQueue() {
     try {
       const proxyAgent = new HttpsProxyAgent(PROXY_URL);
       
-      // ヘッダーを準備
-      const headers = {};
-      if (task.csrftoken) {
-        headers['x-csrftoken'] = task.csrftoken;
-        headers['Cookie'] = `csrftoken=${task.csrftoken}`;
-      }
+      // ★修正: ワーカー側もCookieを合体させる
+      const cookieString = `sessionid=${task.token}; csrftoken=${task.csrftoken}`;
 
-      // ★修正: ここでヘッダーを渡す
       const threadsAPI = new ThreadsAPI({
         username: task.username,
         token: task.token, 
@@ -85,7 +78,10 @@ async function processQueue() {
         axiosConfig: { 
           httpAgent: proxyAgent, 
           httpsAgent: proxyAgent,
-          headers: headers 
+          headers: {
+            'x-csrftoken': task.csrftoken,
+            'Cookie': cookieString // ★修正ポイント
+          }
         },
       });
 
