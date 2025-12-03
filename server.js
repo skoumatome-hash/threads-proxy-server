@@ -96,76 +96,91 @@ async function runPuppeteerPost(task) {
     const cookies = parseCookies(task.fullCookie);
     if (cookies.length > 0) {
       await page.setCookie(...cookies);
+      console.log(`🍪 Cookie ${cookies.length}個をセットしました`);
     }
 
     console.log("🌍 Threadsにアクセス中...");
-    await page.goto("https://www.threads.net/", { waitUntil: 'networkidle2', timeout: 90000 });
+    await page.goto("https://www.threads.net/", { waitUntil: 'networkidle2', timeout: 120000 });
 
-    // ★修正: 「作成(Create)」ボタンを探してクリックする
-    // aria-label="Create" または href="/create" を探す
-    console.log("🔍 「作成」ボタンを探しています...");
+    // ページ読み込み完了まで少し待つ
+    await new Promise(r => setTimeout(r, 5000));
+
+    // ★修正: 投稿エリアを探す (タイムアウトを60秒に延長)
+    const textBoxSelector = 'div[role="textbox"], div[data-lexical-editor="true"]';
     
+    console.log("🔍 「作成」ボタンを探しています...");
+    let createdOpened = false;
+
     try {
-      // メニューバーが表示されるまで待つ
-      await page.waitForSelector('svg[aria-label="Create"], svg[aria-label="作成"]', { timeout: 20000 });
-      
-      // ボタンをクリック
+      // ボタンを探す
+      await page.waitForSelector('svg[aria-label="Create"], svg[aria-label="作成"]', { timeout: 15000 });
       const createBtn = await page.$('svg[aria-label="Create"], svg[aria-label="作成"]');
+      
       if (createBtn) {
+        // 念のためJavaScriptでクリック発火
+        await page.evaluate(el => el.click(), createBtn);
         console.log("✅ 「作成」ボタンをクリックしました");
-        await createBtn.click();
-      } else {
-        // SVGが見つからない場合、リンクを探す
-        console.log("⚠️ SVGが見つかりません。リンクを探します...");
-        await page.click('a[href="/create"]');
+        
+        // クリック後、入力欄が出るか30秒待つ
+        try {
+          await page.waitForSelector(textBoxSelector, { timeout: 30000 });
+          createdOpened = true;
+        } catch(e) {
+          console.log("⚠️ ボタンを押しましたが入力欄が出ません。直接ページへ移動します。");
+        }
       }
     } catch (e) {
-      // 万が一ボタンが見つからなくても、直接URLを叩いて投稿画面を開く
-      console.log("⚠️ ボタンが見つからないため、直接投稿ページへ移動します...");
-      await page.goto("https://www.threads.net/create", { waitUntil: 'networkidle2' });
+      console.log("⚠️ 「作成」ボタンが見つかりません。直接ページへ移動します。");
     }
 
-    // 投稿モーダルが開くのを待つ
-    console.log("⏳ 投稿入力欄を待機中...");
-    const textBoxSelector = 'div[role="textbox"], div[data-lexical-editor="true"]';
-    await page.waitForSelector(textBoxSelector, { timeout: 15000 });
-    
-    // 入力
+    // ボタンで見つからなかった場合、直接URLへ
+    if (!createdOpened) {
+      console.log("🔄 投稿ページ(threads.net/create)へ直接移動します...");
+      await page.goto("https://www.threads.net/create", { waitUntil: 'networkidle2', timeout: 60000 });
+    }
+
+    // 最終確認: 入力欄があるか (60秒待つ)
+    console.log("⏳ 投稿入力欄を待機中(最大60秒)...");
+    await page.waitForSelector(textBoxSelector, { timeout: 60000 });
+    console.log("✅ 入力欄を発見！");
+
+    // 入力処理
     console.log("✍️ テキスト入力中...");
     await page.click(textBoxSelector);
     await new Promise(r => setTimeout(r, 1000));
-    await page.keyboard.type(task.text, { delay: 100 });
-    await new Promise(r => setTimeout(r, 2000));
+    
+    // 確実に入力するため、少しゆっくり打つ
+    await page.type(textBoxSelector, task.text, { delay: 100 });
+    await new Promise(r => setTimeout(r, 3000));
 
-    // 投稿ボタン (Post) を探してクリック
+    // 「Post」ボタンを探してクリック
     console.log("🔘 投稿実行ボタンを探しています...");
     const postBtn = await page.evaluateHandle(() => {
-      // "Post" または "投稿" というテキストを持つボタンを探す
       const buttons = Array.from(document.querySelectorAll('div[role="button"]'));
       return buttons.find(b => 
-        (b.innerText === "Post" || b.innerText === "投稿") && !b.getAttribute('disabled')
+        (b.innerText === "Post" || b.innerText === "投稿") && 
+        !b.hasAttribute('disabled') // 無効化されていないボタンを探す
       );
     });
 
     if (postBtn) {
+      // 念のためスクロールして表示させる
+      await postBtn.hover();
+      await new Promise(r => setTimeout(r, 500));
       await postBtn.click();
-      console.log("✅ ボタンをクリックしました！ 完了待ち...");
-      await new Promise(r => setTimeout(r, 10000)); // 投稿完了まで十分待つ
+      
+      console.log("✅ ボタンをクリックしました！ 投稿完了待ち...");
+      await new Promise(r => setTimeout(r, 15000)); // 投稿完了までたっぷり待つ
       console.log(`🎉 投稿成功: ${task.username}`);
     } else {
+      // ボタンがない場合のデバッグ
+      const bodyText = await page.evaluate(() => document.body.innerText.substring(0, 300));
+      console.log(`画面テキスト: ${bodyText}`);
       throw new Error("「投稿」ボタンが見つからないか、押せない状態です。");
     }
 
   } catch (error) {
     console.error(`❌ 処理失敗: ${error.message}`);
-    // デバッグ: 失敗時の画面テキストをログに出す
-    if (browser) {
-      const page = (await browser.pages())[0];
-      if (page) {
-        const bodyText = await page.evaluate(() => document.body.innerText.substring(0, 300).replace(/\n/g, ' '));
-        console.log(`(参考) 画面テキスト: ${bodyText}`);
-      }
-    }
     throw error;
   } finally {
     if (browser) {
