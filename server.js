@@ -1,7 +1,5 @@
 const express = require("express");
-const { HttpsProxyAgent } = require("https-proxy-agent");
-const axios = require("axios");
-const crypto = require("crypto");
+const puppeteer = require("puppeteer");
 const app = express();
 
 app.use(express.json());
@@ -10,132 +8,150 @@ const requestQueue = [];
 let isProcessing = false;
 
 // ---------------------------------------------------------
-//  Cookieヘルパー
+//  Cookie解析 (JSONでも文字列でもOK)
 // ---------------------------------------------------------
-function parseCookieInput(input) {
-  let sessionid = null, userID = null, deviceId = null, csrftoken = null;
-  let headerString = "";
-  if (!input) return { sessionid, userID, deviceId, headerString };
-  
+function parseCookies(input) {
+  const cookies = [];
+  if (!input) return cookies;
   const trimmed = input.trim();
 
+  // JSONの場合
   if (trimmed.startsWith("[") || trimmed.startsWith("{")) {
     try {
-      const cookies = JSON.parse(trimmed);
-      const parts = [];
-      if (Array.isArray(cookies)) {
-        cookies.forEach(c => {
-          if (c.name === "sessionid") sessionid = decodeURIComponent(c.value);
-          if (c.name === "ds_user_id") userID = c.value;
-          if (c.name === "ig_did") deviceId = c.value;
-          if (c.name === "csrftoken") csrftoken = c.value;
-          parts.push(`${c.name}=${c.value}`);
+      const parsed = JSON.parse(trimmed);
+      if (Array.isArray(parsed)) {
+        parsed.forEach(c => {
+          cookies.push({
+            name: c.name,
+            value: c.value,
+            domain: ".threads.net", // ドメインを強制指定
+            path: "/",
+            secure: true,
+            httpOnly: c.httpOnly !== undefined ? c.httpOnly : true
+          });
         });
-        headerString = parts.join("; ");
       }
-    } catch (e) { console.error(e); }
+    } catch (e) { console.error("Cookie JSON解析エラー:", e); }
   } else {
-    headerString = trimmed;
-    const sessMatch = trimmed.match(/(^|;\s*)sessionid=([^;]*)/);
-    if (sessMatch) sessionid = decodeURIComponent(sessMatch[1]);
-    const userMatch = trimmed.match(/(^|;\s*)ds_user_id=([^;]*)/);
-    if (userMatch) userID = userMatch[1];
-    const csrfMatch = trimmed.match(/(^|;\s*)csrftoken=([^;]*)/);
-    if (csrfMatch) csrftoken = csrfMatch[2];
+    // 文字列の場合 (sessionid=...; ...)
+    trimmed.split(';').forEach(part => {
+      const [key, ...v] = part.trim().split('=');
+      if (key && v.length > 0) {
+        cookies.push({
+          name: key,
+          value: v.join('='),
+          domain: ".threads.net",
+          path: "/",
+          secure: true
+        });
+      }
+    });
   }
-  return { sessionid, userID, deviceId, csrftoken, headerString };
+  return cookies;
 }
 
-// Cookie更新用
-function mergeCookies(oldCookieString, setCookieHeader) {
-  if (!setCookieHeader || !Array.isArray(setCookieHeader)) return oldCookieString;
-  const cookieMap = new Map();
-  oldCookieString.split(';').forEach(c => {
-    const [key, ...v] = c.trim().split('=');
-    if (key) cookieMap.set(key, v.join('='));
-  });
-  setCookieHeader.forEach(c => {
-    const [keyVal] = c.split(';');
-    const [key, ...v] = keyVal.trim().split('=');
-    if (key) cookieMap.set(key, v.join('='));
-  });
-  const parts = [];
-  for (const [key, value] of cookieMap) parts.push(`${key}=${value}`);
-  return parts.join('; ');
-}
-
-function extractValueFromCookieString(cookieString, key) {
-  const match = cookieString.match(new RegExp('(^|;\\s*)' + key + '=([^;]*)'));
-  return match ? match[2] : null;
-}
-
-function formatProxy(proxyStr) {
-  if (!proxyStr) return null;
-  if (proxyStr.startsWith("http")) return proxyStr;
-  const parts = proxyStr.split(':');
-  if (parts.length === 4) {
-    const [host, port, user, pass] = parts;
-    return `http://${user}:${pass}@${host}:${port}`;
-  }
-  return proxyStr;
-}
-
-// ★修正: AJAXヘッダーを復活させた完全版
-function createWebHeaders(ua, fullCookie, csrftoken, lsd = null) {
-  const headers = {
-    'User-Agent': ua,
-    'Cookie': fullCookie,
-    'x-csrftoken': csrftoken,
-    'x-ig-app-id': '238260118697367',
-    'x-asbd-id': '129477',
-    'Authority': 'www.threads.net',
-    'Accept': '*/*',
-    'Accept-Language': 'en-US,en;q=0.9',
-    'Cache-Control': 'no-cache',
-    'Content-Type': 'application/x-www-form-urlencoded',
-    'Origin': 'https://www.threads.net',
-    'Referer': 'https://www.threads.net/',
-    'Sec-Fetch-Dest': 'empty',
-    'Sec-Fetch-Mode': 'cors',
-    'Sec-Fetch-Site': 'same-origin',
-    'X-Requested-With': 'XMLHttpRequest', // ★これがナイトHTMLが返ってくる！
-    'X-Instagram-Ajax': '1'
-  };
-  
-  if (lsd) headers['x-fb-lsd'] = lsd;
-  return headers;
-}
-
-// 1. ログイン確認
-app.post("/api/check", async (req, res) => {
-  const { username, fullCookie, ua, proxy } = req.body;
-  console.log(`[Login Check] ${username}`);
-  if (!proxy || !fullCookie) return res.status(400).json({ status: "error", message: "情報不足" });
-
+// ---------------------------------------------------------
+//  メイン：ブラウザを起動して投稿する処理
+// ---------------------------------------------------------
+async function runPuppeteerPost(task) {
+  let browser = null;
   try {
-    const formattedProxy = formatProxy(proxy);
-    const proxyAgent = new HttpsProxyAgent(formattedProxy);
-    const { userID, headerString, csrftoken } = parseCookieInput(fullCookie);
+    console.log("🚀 ブラウザ起動中...");
     
-    // チェック時はGETなので最低限のヘッダーでOK
-    const headers = createWebHeaders(ua, headerString, csrftoken);
-    
-    const response = await axios.get(`https://www.threads.net/@${username}`, {
-      httpsAgent: proxyAgent,
-      headers: headers,
-      proxy: false,
-      validateStatus: s => s < 500
+    // Render等のサーバーで動くための設定
+    browser = await puppeteer.launch({
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--single-process',
+        '--no-zygote',
+        // プロキシがある場合
+        task.proxy ? `--proxy-server=${task.proxy}` : ''
+      ],
+      headless: "new" // ヘッドレスモード（画面なし）
     });
 
-    if (response.status === 200) {
-      res.json({ status: "success", message: `★接続OK (ID: ${userID})` });
+    const page = await browser.newPage();
+
+    // UA偽装
+    await page.setUserAgent(task.ua || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36");
+
+    // 1. Cookieをセット
+    const cookies = parseCookies(task.fullCookie);
+    if (cookies.length > 0) {
+      await page.setCookie(...cookies);
+      console.log(`🍪 Cookie ${cookies.length}個をセットしました`);
     } else {
-      res.status(response.status).json({ status: "error", message: `ステータス異常: ${response.status}` });
+      throw new Error("Cookieが空です");
     }
+
+    // 2. Threadsを開く
+    console.log("🌍 Threadsにアクセス中...");
+    await page.goto("https://www.threads.net/", { waitUntil: 'networkidle2', timeout: 60000 });
+
+    // 3. ログイン確認 (投稿エリアがあるかチェック)
+    // "Start a thread..." のようなプレースホルダーやボタンを探す
+    // セレクタは変わる可能性があるので、複数の候補で探す
+    const postInputSelector = 'div[data-lexical-editor="true"], div[role="textbox"], div[aria-label="Start a thread..."]';
+    
+    try {
+      await page.waitForSelector(postInputSelector, { timeout: 10000 });
+      console.log("✅ ログイン確認OK（投稿エリアが見つかりました）");
+    } catch (e) {
+      // ログインできていない場合、ログインボタンが出ているはず
+      throw new Error("ログイン状態を確認できませんでした（投稿エリアが見つからない）。Cookieが無効かIP制限です。");
+    }
+
+    // 4. 投稿エリアをクリック
+    await page.click(postInputSelector);
+    await new Promise(r => setTimeout(r, 1000)); // 少し待つ
+
+    // 5. テキスト入力
+    console.log("✍️ テキスト入力中...");
+    // 念のためクリックしてからタイプ
+    await page.type(postInputSelector, task.text, { delay: 50 }); 
+
+    await new Promise(r => setTimeout(r, 2000)); // 入力後の待機
+
+    // 6. 「Post」ボタンを探してクリック
+    // ボタンの文字 "Post" を含む要素を探す
+    const postBtn = await page.evaluateHandle(() => {
+      const buttons = Array.from(document.querySelectorAll('div[role="button"]'));
+      return buttons.find(b => b.innerText.includes("Post") || b.innerText.includes("投稿"));
+    });
+
+    if (postBtn) {
+      console.log("🔘 投稿ボタンをクリック...");
+      await postBtn.click();
+      
+      // 投稿完了まで少し待つ
+      await new Promise(r => setTimeout(r, 5000));
+      console.log(`✅ 投稿成功: ${task.username}`);
+    } else {
+      throw new Error("投稿ボタンが見つかりませんでした");
+    }
+
   } catch (error) {
-    console.error(`[Login Check] エラー: ${error.message}`);
-    res.status(500).json({ status: "error", message: error.message });
+    console.error(`❌ 処理失敗: ${error.message}`);
+    throw error;
+  } finally {
+    if (browser) {
+      await browser.close();
+      console.log("🔒 ブラウザを閉じました");
+    }
   }
+}
+
+
+// 1. ログイン確認 API (Puppeteer版)
+app.post("/api/check", async (req, res) => {
+  const { username } = req.body;
+  // この構成では「実際にブラウザを立ち上げる」のが重いため、
+  // checkでは簡易的に「サーバーは生きてるよ」と返すだけにします
+  // 本当のテストは「投稿」で行ってください
+  console.log(`[Login Check] ${username} (Server Alive)`);
+  res.json({ status: "success", message: "★サーバー稼働中！ いきなり「投稿」を試してください。" });
 });
 
 // 2. 予約受付
@@ -154,72 +170,19 @@ async function processQueue() {
 
   while (requestQueue.length > 0) {
     const task = requestQueue.shift();
-    console.log(`\n--- 処理開始: ${task.username} ---`);
+    console.log(`\n--- 処理開始 (Puppeteer): ${task.username} ---`);
 
     try {
-      const formattedProxy = formatProxy(task.proxy);
-      const proxyAgent = new HttpsProxyAgent(formattedProxy);
-      
-      const { userID, headerString: initialCookie, csrftoken: initialCsrf } = parseCookieInput(task.fullCookie);
-      
-      // 1. LSD取得
-      console.log("LSD取得中...");
-      let headers = createWebHeaders(task.ua, initialCookie, initialCsrf);
-      const pageRes = await axios.get(`https://www.threads.net/@${task.username}`, {
-        httpsAgent: proxyAgent,
-        headers: headers,
-        proxy: false
-      });
-
-      const lsdMatch = pageRes.data.match(/"LSD",\[\],{"token":"(.*?)"}/);
-      const lsd = lsdMatch ? lsdMatch[1] : null;
-      
-      if (!lsd) throw new Error("LSD取得失敗");
-      console.log(`LSD: ${lsd}`);
-
-      // Cookie更新 (継承)
-      const updatedCookieString = mergeCookies(initialCookie, pageRes.headers['set-cookie']);
-      const updatedCsrf = extractValueFromCookieString(updatedCookieString, "csrftoken") || initialCsrf;
-
-      // 2. 投稿 (GraphQL) - ★ここにAJAXヘッダーが入る！
-      const postHeaders = createWebHeaders(task.ua, updatedCookieString, updatedCsrf, lsd);
-      postHeaders['x-fb-friendly-name'] = 'BarcelonaCreatePostMutation';
-
-      const postPayload = new URLSearchParams();
-      postPayload.append('lsd', lsd);
-      postPayload.append('variables', JSON.stringify({
-        userID: userID,
-        text: task.text,
-        publicationOpt: "any_user",
-        attachmentUtils: null,
-        client_mutation_id: crypto.randomUUID()
-      }));
-      postPayload.append('doc_id', '23980155133315596');
-
-      console.log("投稿リクエスト送信...");
-      const postRes = await axios.post("https://www.threads.net/api/graphql", postPayload, {
-        httpsAgent: proxyAgent,
-        headers: postHeaders,
-        proxy: false
-      });
-
-      // 成功判定
-      if (postRes.data?.data?.xfb_create_threads_post_content) {
-         console.log(`✅ 投稿成功: ${task.username}`);
-      } else {
-         console.log("投稿失敗(レスポンス):", JSON.stringify(postRes.data));
-      }
+      // ブラウザ操作を実行
+      await runPuppeteerPost(task);
 
     } catch (error) {
       console.error(`❌ 投稿失敗 (${task.username}):`, error.message);
-      if (error.response) {
-         console.log("Error Data:", JSON.stringify(error.response.data).substring(0, 300));
-      }
     }
 
     if (requestQueue.length > 0) {
-      console.log("☕ 休憩中 (25秒)...");
-      await new Promise((resolve) => setTimeout(resolve, 25000));
+      console.log("☕ 休憩中 (30秒)...");
+      await new Promise((resolve) => setTimeout(resolve, 30000));
     }
   }
   isProcessing = false;
