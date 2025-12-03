@@ -1,12 +1,22 @@
 const express = require("express");
+const { ThreadsAPI } = require("threads-api");
 const { HttpsProxyAgent } = require("https-proxy-agent");
-const axios = require("axios");
 const app = express();
 
 app.use(express.json());
 
 const requestQueue = [];
 let isProcessing = false;
+
+// ---------------------------------------------------------
+//  Cookie文字列から値を抜き出す関数
+// ---------------------------------------------------------
+function getCookieValue(cookieString, key) {
+  if (!cookieString) return null;
+  const match = cookieString.match(new RegExp('(^|;\\s*)' + key + '=([^;]*)'));
+  if (match && match[2]) return decodeURIComponent(match[2]);
+  return null;
+}
 
 // ---------------------------------------------------------
 //  プロキシ形式変換 (host:port:user:pass -> http://...)
@@ -22,95 +32,24 @@ function formatProxy(proxyStr) {
   return proxyStr;
 }
 
-// ---------------------------------------------------------
-//  WEBブラウザ用ヘッダー生成 (sessionid一本勝負)
-// ---------------------------------------------------------
-function createWebHeaders(ua, sessionid, csrftoken, lsd = null) {
-  // sessionidの%3Aなどをデコード
-  const cleanSessionId = decodeURIComponent(sessionid);
-  
-  const headers = {
-    'User-Agent': ua,
-    'Cookie': `sessionid=${cleanSessionId}`, // 余計なものは混ぜない
-    'x-ig-app-id': '238260118697367', // WEB版AppID
-    'x-asbd-id': '129477',
-    'Authority': 'www.threads.net',
-    'Accept': '*/*',
-    'Accept-Language': 'en-US,en;q=0.9',
-    'Cache-Control': 'no-cache',
-    'Content-Type': 'application/x-www-form-urlencoded',
-    'Origin': 'https://www.threads.net',
-    'Referer': 'https://www.threads.net/',
-    'Sec-Fetch-Dest': 'empty',
-    'Sec-Fetch-Mode': 'cors',
-    'Sec-Fetch-Site': 'same-origin',
-  };
-
-  if (csrftoken) {
-    headers['x-csrftoken'] = csrftoken;
-    headers['Cookie'] += `; csrftoken=${csrftoken}`;
-  }
-  
-  if (lsd) {
-    headers['x-fb-lsd'] = lsd;
-  }
-  
-  return headers;
-}
-
-// ---------------------------------------------------------
-//  LSDトークンとUserIDをページから取得
-// ---------------------------------------------------------
-async function fetchPageData(username, agent, headers) {
-  try {
-    const response = await axios.get(`https://www.threads.net/@${username}`, {
-      httpsAgent: agent,
-      headers: headers,
-      proxy: false,
-      validateStatus: s => s < 500
-    });
-    
-    const html = response.data;
-    
-    // LSDを探す
-    const lsdMatch = html.match(/"LSD",\[\],{"token":"(.*?)"}/);
-    const lsd = lsdMatch ? lsdMatch[1] : null;
-
-    // UserIDを探す (ds_user_idがクッキーになくてもページから拾う)
-    const userIdMatch = html.match(/"user_id":"(\d+)"/);
-    const userId = userIdMatch ? userIdMatch[1] : null;
-
-    return { lsd, userId };
-  } catch (e) {
-    console.error("ページ取得エラー:", e.message);
-    return { lsd: null, userId: null };
-  }
-}
-
 // 1. ログイン確認
 app.post("/api/check", async (req, res) => {
-  const { username, fullCookie, ua, proxy } = req.body; // I2の値を fullCookie として受け取る
+  const { username, fullCookie, ua, proxy } = req.body;
   console.log(`[Login Check] ${username}`);
 
   if (!proxy || !fullCookie) return res.status(400).json({ status: "error", message: "情報不足" });
 
   try {
-    const formattedProxy = formatProxy(proxy);
-    const proxyAgent = new HttpsProxyAgent(formattedProxy);
-    
-    // I2セルの中身をそのまま sessionid として扱う
-    const sessionid = fullCookie.trim(); 
+    // CookieからIDとセッションを抜く
+    const sessionid = getCookieValue(fullCookie, "sessionid");
+    const userID = getCookieValue(fullCookie, "ds_user_id");
 
-    // まずページにアクセスして生存確認
-    // (CSRFトークンは初回は無くてもGETなら通ることが多い)
-    const headers = createWebHeaders(ua, sessionid, null);
-    const { lsd, userId } = await fetchPageData(username, proxyAgent, headers);
-
-    if (lsd) {
-      res.json({ status: "success", message: `★ログイン成功！ (LSD取得OK)` });
-    } else {
-      res.status(403).json({ status: "error", message: "ページにアクセスできませんでした(403)。Cookieが無効かプロキシ拒否。" });
+    if (!sessionid || !userID) {
+      return res.status(400).json({ status: "error", message: "Cookieからsessionidまたはds_user_idが見つかりません" });
     }
+
+    // ★セッションIDが生きていれば、これだけで十分
+    res.json({ status: "success", message: `★ID抽出OK: ${userID}\n(セッションID: ${sessionid.substring(0,5)}...)` });
 
   } catch (error) {
     console.error(`[Login Check] エラー: ${error.message}`);
@@ -122,7 +61,7 @@ app.post("/api/check", async (req, res) => {
 app.post("/api/enqueue", (req, res) => {
   const { username, fullCookie, text, deviceId, imageUrl, ua, proxy } = req.body;
   requestQueue.push({ username, fullCookie, text, deviceId, imageUrl, ua, proxy });
-  console.log(`[受付] ${username}`);
+  console.log(`[受付] ${username} を予約`);
   res.json({ status: "queued", message: "予約完了" });
   processQueue();
 });
@@ -140,47 +79,39 @@ async function processQueue() {
       const formattedProxy = formatProxy(task.proxy);
       const proxyAgent = new HttpsProxyAgent(formattedProxy);
       
-      // I2セルの値をsessionidとして使用
-      const sessionid = task.fullCookie.trim();
+      // 必要な情報を抽出
+      const sessionid = getCookieValue(task.fullCookie, "sessionid");
+      const userID = getCookieValue(task.fullCookie, "ds_user_id");
+      const ig_did = getCookieValue(task.fullCookie, "ig_did") || task.deviceId;
 
-      // 1. LSDとUserIDを取得
-      let headers = createWebHeaders(task.ua, sessionid, null);
-      const { lsd, userId } = await fetchPageData(task.username, proxyAgent, headers);
-      
-      if (!lsd) throw new Error("LSDトークン取得失敗");
-      if (!userId) throw new Error("UserID取得失敗");
-
-      console.log(`準備OK: LSD=${lsd.substring(0,5)}..., UserID=${userId}`);
-
-      // 2. 投稿 (GraphQL)
-      headers = createWebHeaders(task.ua, sessionid, null, lsd);
-      headers['x-fb-friendly-name'] = 'BarcelonaCreatePostMutation';
-
-      const postPayload = new URLSearchParams();
-      postPayload.append('lsd', lsd);
-      postPayload.append('variables', JSON.stringify({
-        userID: userId,
-        text: task.text,
-        publicationOpt: "any_user",
-        attachmentUtils: null
-      }));
-      postPayload.append('doc_id', '23980155133315596');
-
-      const response = await axios.post("https://www.threads.net/api/graphql", postPayload, {
-        httpsAgent: proxyAgent,
-        headers: headers,
-        proxy: false
+      // ★ここが重要：ライブラリを「認証済み状態」で起動する
+      const threadsAPI = new ThreadsAPI({
+        username: task.username,
+        token: sessionid,  // ★本物のセッションIDを渡す！
+        deviceID: ig_did,  // ★本物のデバイスIDを渡す！
+        axiosConfig: { 
+          httpAgent: proxyAgent, 
+          httpsAgent: proxyAgent,
+          headers: {
+            'User-Agent': task.ua,     // ★ADSPOWERのUA
+            'Cookie': task.fullCookie  // ★念のため全Cookieも渡す
+          }
+        },
       });
 
-      if (response.data.errors) {
-         console.error("GraphQLErrors:", JSON.stringify(response.data.errors));
-      } else {
-         console.log(`✅ 投稿成功: ${task.username}`);
-      }
+      // ★余計なチェック(getUserProfile等)は一切せず、いきなり投稿する！
+      console.log("投稿リクエスト送信...");
+      await threadsAPI.publish({ text: task.text, image: task.imageUrl });
+      
+      console.log(`✅ 投稿成功: ${task.username}`);
 
     } catch (error) {
       console.error(`❌ 投稿失敗 (${task.username}):`, error.message);
-      if (error.response) console.log(JSON.stringify(error.response.data));
+      // 詳細ログ
+      if (error.response) {
+        console.log("--- Error Response ---");
+        console.log(JSON.stringify(error.response.data));
+      }
     }
 
     if (requestQueue.length > 0) {
