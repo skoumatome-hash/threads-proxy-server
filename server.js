@@ -9,7 +9,7 @@ app.use(express.json());
 const requestQueue = [];
 let isProcessing = false;
 
-// Cookieから値を抜く
+// Cookie値の抽出
 function getCookieValue(cookieString, key) {
   if (!cookieString) return null;
   const match = cookieString.match(new RegExp('(^|;\\s*)' + key + '=([^;]*)'));
@@ -17,7 +17,7 @@ function getCookieValue(cookieString, key) {
   return null;
 }
 
-// プロキシ形式変換 (host:port:user:pass -> http://...)
+// プロキシ形式変換
 function formatProxy(proxyStr) {
   if (!proxyStr) return null;
   if (proxyStr.startsWith("http")) return proxyStr;
@@ -29,40 +29,42 @@ function formatProxy(proxyStr) {
   return proxyStr;
 }
 
+// 共通ヘッダー生成関数 (成功した設定をここ一箇所で作る)
+function createBrowserHeaders(ua, fullCookie, csrftoken) {
+  return {
+    'User-Agent': ua,
+    'Cookie': fullCookie,
+    'x-csrftoken': csrftoken,
+    'x-ig-app-id': '238260118697367', // ★これが超重要！WebブラウザのID
+    'x-asbd-id': '129477',
+    'Authority': 'www.threads.net',
+    'Accept': '*/*',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Cache-Control': 'no-cache',
+    'Origin': 'https://www.threads.net',
+    'Referer': 'https://www.threads.net/',
+    'Sec-Fetch-Dest': 'empty',
+    'Sec-Fetch-Mode': 'cors',
+    'Sec-Fetch-Site': 'same-origin',
+  };
+}
+
 // 1. ログイン確認
 app.post("/api/check", async (req, res) => {
   const { username, fullCookie, ua, proxy } = req.body;
   console.log(`[Login Check] ${username}`);
 
-  if (!proxy || !fullCookie) {
-    return res.status(400).json({ status: "error", message: "情報不足" });
-  }
+  if (!proxy || !fullCookie) return res.status(400).json({ status: "error", message: "情報不足" });
 
   try {
     const formattedProxy = formatProxy(proxy);
     const proxyAgent = new HttpsProxyAgent(formattedProxy);
     const realCsrf = getCookieValue(fullCookie, "csrftoken");
 
-    // 成功したヘッダー構成
-    const headers = {
-      'User-Agent': ua,
-      'Cookie': fullCookie,
-      'x-csrftoken': realCsrf,
-      'x-ig-app-id': '238260118697367',
-      'x-asbd-id': '129477',
-      'Authority': 'www.threads.net',
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-      'Accept-Language': 'en-US,en;q=0.9',
-      'Cache-Control': 'no-cache',
-      'Sec-Fetch-Dest': 'document',
-      'Sec-Fetch-Mode': 'navigate',
-      'Sec-Fetch-Site': 'none',
-      'Sec-Fetch-User': '?1',
-      'Upgrade-Insecure-Requests': '1'
-    };
+    // 成功実績のあるヘッダーを使用
+    const headers = createBrowserHeaders(ua, fullCookie, realCsrf);
 
     const targetUrl = `https://www.threads.net/@${username}`;
-
     const response = await axios.get(targetUrl, {
       httpsAgent: proxyAgent,
       headers: headers,
@@ -73,7 +75,7 @@ app.post("/api/check", async (req, res) => {
     console.log(`Check Response: ${response.status}`);
 
     if (response.status === 200) {
-      res.json({ status: "success", message: "★ログイン確認よし！ (Profile Page 200 OK)" });
+      res.json({ status: "success", message: "★ログイン確認よし！ (Web ID一致)" });
     } else if (response.status === 404) {
       res.status(404).json({ status: "error", message: "ページが見つかりません (404)" });
     } else {
@@ -105,7 +107,6 @@ async function processQueue() {
     console.log(`\n--- 処理開始: ${task.username} ---`);
 
     try {
-      // ★修正: ここでプロキシ変換を忘れていたのを修正！
       const formattedProxy = formatProxy(task.proxy);
       const proxyAgent = new HttpsProxyAgent(formattedProxy);
       
@@ -113,20 +114,8 @@ async function processQueue() {
       const realCsrf = getCookieValue(task.fullCookie, "csrftoken");
       const realDeviceId = getCookieValue(task.fullCookie, "ig_did") || task.deviceId;
 
-      // ★修正: 成功したヘッダーをここにも適用
-      // (API呼び出し用なので一部調整していますが、基本構成は同じです)
-      const headers = {
-        'User-Agent': task.ua,
-        'Cookie': task.fullCookie,
-        'x-csrftoken': realCsrf,
-        'x-ig-app-id': '238260118697367',
-        'x-asbd-id': '129477',
-        'Origin': 'https://www.threads.net',
-        'Referer': 'https://www.threads.net/',
-        'Sec-Fetch-Dest': 'empty',
-        'Sec-Fetch-Mode': 'cors',
-        'Sec-Fetch-Site': 'same-origin',
-      };
+      // ★成功した「Webブラウザ用ヘッダー」を作成
+      const browserHeaders = createBrowserHeaders(task.ua, task.fullCookie, realCsrf);
 
       const threadsAPI = new ThreadsAPI({
         username: task.username,
@@ -135,7 +124,7 @@ async function processQueue() {
         axiosConfig: { 
           httpAgent: proxyAgent, 
           httpsAgent: proxyAgent,
-          headers: headers // ★最強ヘッダー注入
+          headers: browserHeaders // ★これをライブラリに強制注入
         },
       });
 
