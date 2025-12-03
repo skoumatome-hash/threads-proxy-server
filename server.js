@@ -1,5 +1,4 @@
 const express = require("express");
-const { ThreadsAPI } = require("threads-api");
 const { HttpsProxyAgent } = require("https-proxy-agent");
 const axios = require("axios");
 const app = express();
@@ -34,25 +33,54 @@ function formatProxy(proxyStr) {
 }
 
 // ---------------------------------------------------------
-//  ブラウザ偽装ヘッダー作成 (成功実績あり)
+//  WEBブラウザと同じヘッダーを作る
 // ---------------------------------------------------------
-function createBrowserHeaders(ua, fullCookie, csrftoken) {
-  return {
+function createWebHeaders(ua, fullCookie, csrftoken, lsd = null) {
+  const headers = {
     'User-Agent': ua,
     'Cookie': fullCookie,
     'x-csrftoken': csrftoken,
-    'x-ig-app-id': '238260118697367', // WebブラウザのAppID
+    'x-ig-app-id': '238260118697367', // WEB版のAppID
     'x-asbd-id': '129477',
     'Authority': 'www.threads.net',
     'Accept': '*/*',
     'Accept-Language': 'en-US,en;q=0.9',
     'Cache-Control': 'no-cache',
+    'Content-Type': 'application/x-www-form-urlencoded',
     'Origin': 'https://www.threads.net',
     'Referer': 'https://www.threads.net/',
     'Sec-Fetch-Dest': 'empty',
     'Sec-Fetch-Mode': 'cors',
     'Sec-Fetch-Site': 'same-origin',
   };
+  
+  if (lsd) {
+    headers['x-fb-lsd'] = lsd;
+  }
+  
+  return headers;
+}
+
+// ---------------------------------------------------------
+//  LSDトークンをページからスクレイピングする
+// ---------------------------------------------------------
+async function fetchLSD(username, agent, headers) {
+  try {
+    const response = await axios.get(`https://www.threads.net/@${username}`, {
+      httpsAgent: agent,
+      headers: headers,
+      proxy: false
+    });
+    
+    // HTMLの中から "LSD", [], {"token": "..."} を探す
+    const match = response.data.match(/"LSD",\[\],{"token":"(.*?)"}/);
+    if (match && match[1]) {
+      return match[1];
+    }
+  } catch (e) {
+    console.error("LSD取得エラー:", e.message);
+  }
+  return null;
 }
 
 // 1. ログイン確認 (兼 接続テスト)
@@ -60,26 +88,20 @@ app.post("/api/check", async (req, res) => {
   const { username, fullCookie, ua, proxy } = req.body;
   console.log(`[Login Check] ${username}`);
 
-  if (!proxy || !fullCookie) return res.status(400).json({ status: "error", message: "情報不足" });
-
   try {
     const formattedProxy = formatProxy(proxy);
     const proxyAgent = new HttpsProxyAgent(formattedProxy);
     const realCsrf = getCookieValue(fullCookie, "csrftoken");
-    const headers = createBrowserHeaders(ua, fullCookie, realCsrf);
+    
+    // まずLSDを取得できるかテスト
+    const headers = createWebHeaders(ua, fullCookie, realCsrf);
+    const lsd = await fetchLSD(username, proxyAgent, headers);
 
-    const targetUrl = `https://www.threads.net/@${username}`;
-    const response = await axios.get(targetUrl, {
-      httpsAgent: proxyAgent,
-      headers: headers,
-      proxy: false,
-      validateStatus: status => status < 500
-    });
-
-    if (response.status === 200) {
-      res.json({ status: "success", message: "★接続OK！ (Webとして認識されました)" });
+    if (lsd) {
+      res.json({ status: "success", message: `★完全接続OK！ (Web Token: ${lsd.substring(0,5)}...)` });
     } else {
-      res.status(response.status).json({ status: "error", message: `ステータス異常: ${response.status}` });
+      // LSDが取れない＝ログインページに飛ばされている可能性大
+      res.status(403).json({ status: "error", message: "ログインできませんでした（Webページ読み込み失敗）" });
     }
 
   } catch (error) {
@@ -97,7 +119,7 @@ app.post("/api/enqueue", (req, res) => {
   processQueue();
 });
 
-// 3. 処理ワーカー (修正済み)
+// 3. 処理ワーカー (脱ライブラリ・完全Web版)
 async function processQueue() {
   if (isProcessing || requestQueue.length === 0) return;
   isProcessing = true;
@@ -109,37 +131,48 @@ async function processQueue() {
     try {
       const formattedProxy = formatProxy(task.proxy);
       const proxyAgent = new HttpsProxyAgent(formattedProxy);
-      
-      const sessionid = getCookieValue(task.fullCookie, "sessionid");
       const realCsrf = getCookieValue(task.fullCookie, "csrftoken");
-      const realDeviceId = getCookieValue(task.fullCookie, "ig_did") || task.deviceId;
+      const userID = getCookieValue(task.fullCookie, "ds_user_id");
 
-      // ヘッダーを準備
-      const browserHeaders = createBrowserHeaders(task.ua, task.fullCookie, realCsrf);
+      // 1. まずLSDトークンを取得
+      let headers = createWebHeaders(task.ua, task.fullCookie, realCsrf);
+      const lsd = await fetchLSD(task.username, proxyAgent, headers);
+      
+      if (!lsd) throw new Error("LSDトークンの取得に失敗しました");
 
-      // クライアント作成
-      // ★修正: interceptorsを使わず、ここでheadersを渡す
-      const threadsAPI = new ThreadsAPI({
-        username: task.username,
-        token: sessionid,
-        deviceID: realDeviceId,
-        axiosConfig: { 
-          httpAgent: proxyAgent, 
-          httpsAgent: proxyAgent,
-          headers: browserHeaders // ★ここで最強ヘッダーを注入
-        },
+      // 2. 投稿用のヘッダーに更新
+      headers = createWebHeaders(task.ua, task.fullCookie, realCsrf, lsd);
+
+      // 3. 投稿ペイロード作成 (GraphQL)
+      const postPayload = new URLSearchParams();
+      postPayload.append('lsd', lsd);
+      postPayload.append('variables', JSON.stringify({
+        userID: userID,
+        text: task.text,
+        // 画像がある場合は添付処理が必要ですが、まずはテキスト投稿を成功させます
+        // internal_badge_payload: null,
+        // link_attachment_url: null
+      }));
+      postPayload.append('doc_id', '23980155133315596'); // Web版のCreate Post ID (汎用)
+
+      // 4. 投稿実行
+      console.log("投稿リクエスト送信...");
+      const response = await axios.post("https://www.threads.net/api/graphql", postPayload, {
+        httpsAgent: proxyAgent,
+        headers: headers,
+        proxy: false
       });
 
-      console.log("投稿リクエスト送信...");
-      await threadsAPI.publish({ text: task.text, image: task.imageUrl });
-      
-      console.log(`✅ 投稿成功: ${task.username}`);
+      // 成功判定
+      if (response.data && response.data.data) {
+        console.log(`✅ 投稿成功: ${task.username}`);
+      } else {
+        console.error("投稿失敗レスポンス:", JSON.stringify(response.data));
+      }
 
     } catch (error) {
       console.error(`❌ 投稿失敗 (${task.username}):`, error.message);
-      if (error.response) {
-        console.log(JSON.stringify(error.response.data));
-      }
+      if (error.response) console.log(JSON.stringify(error.response.data));
     }
 
     if (requestQueue.length > 0) {
