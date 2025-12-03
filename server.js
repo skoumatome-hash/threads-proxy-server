@@ -5,7 +5,7 @@ const app = express();
 
 app.use(express.json());
 
-// ▼▼▼ プロキシ設定（そのままでOK） ▼▼▼
+// ▼▼▼ プロキシ設定（変更なし） ▼▼▼
 const PROXY_URL = 'http://86a4c5a5d75ab064cd33__cr.jp:ae68af898d6ead3b@gw.dataimpulse.com:823';
 // ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
 
@@ -19,8 +19,8 @@ app.post("/api/check", async (req, res) => {
 
   try {
     const proxyAgent = new HttpsProxyAgent(PROXY_URL);
-    // ★重要: パスワードではなく token (sessionid) を使う
     const threadsAPI = new ThreadsAPI({
+      username: username, // ここは username でOK
       token: token, 
       deviceID: deviceId,
       axiosConfig: { httpAgent: proxyAgent, httpsAgent: proxyAgent },
@@ -56,8 +56,9 @@ async function processQueue() {
     try {
       const proxyAgent = new HttpsProxyAgent(PROXY_URL);
       
-      // ★Cookieを使ってログインをスキップして初期化
+      // ★修正ポイント： task.username を渡すように明記しました
       const threadsAPI = new ThreadsAPI({
+        username: task.username, // ★ここが重要！
         token: task.token, 
         deviceID: task.deviceId,
         axiosConfig: { httpAgent: proxyAgent, httpsAgent: proxyAgent },
@@ -67,6 +68,7 @@ async function processQueue() {
       console.log(`✅ 投稿成功: ${task.username}`);
 
     } catch (error) {
+      // エラーログも task.username を使うように修正
       console.error(`❌ 投稿失敗 (${task.username}):`, error.message);
     }
 
