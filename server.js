@@ -14,14 +14,13 @@ let isProcessing = false;
 
 // 1. ログイン確認用
 app.post("/api/check", async (req, res) => {
-  const { username, token, deviceId, csrftoken } = req.body;
+  const { username, token, deviceId, csrftoken, ua } = req.body;
   console.log(`[Login Check] ${username}`);
 
   try {
     const proxyAgent = new HttpsProxyAgent(PROXY_URL);
     
-    // ★修正: Cookieを合体させる
-    // sessionid と csrftoken を両方とも1つの文字列にする
+    // Cookieを合体
     const cookieString = `sessionid=${token}; csrftoken=${csrftoken}`;
 
     const threadsAPI = new ThreadsAPI({
@@ -33,7 +32,8 @@ app.post("/api/check", async (req, res) => {
         httpsAgent: proxyAgent,
         headers: {
           'x-csrftoken': csrftoken,
-          'Cookie': cookieString // ★ここが修正ポイント！上書きせず合体版を渡す
+          'Cookie': cookieString,
+          'User-Agent': ua // ★ここが重要！ADSPOWERの顔をする
         }
       },
     });
@@ -49,8 +49,8 @@ app.post("/api/check", async (req, res) => {
 
 // 2. 予約受付
 app.post("/api/enqueue", (req, res) => {
-  const { username, token, text, deviceId, imageUrl, csrftoken } = req.body;
-  requestQueue.push({ username, token, text, deviceId, imageUrl, csrftoken });
+  const { username, token, text, deviceId, imageUrl, csrftoken, ua } = req.body;
+  requestQueue.push({ username, token, text, deviceId, imageUrl, csrftoken, ua });
   console.log(`[受付] ${username} を予約`);
   res.json({ status: "queued", message: "予約完了" });
   processQueue();
@@ -67,8 +67,6 @@ async function processQueue() {
 
     try {
       const proxyAgent = new HttpsProxyAgent(PROXY_URL);
-      
-      // ★修正: ワーカー側もCookieを合体させる
       const cookieString = `sessionid=${task.token}; csrftoken=${task.csrftoken}`;
 
       const threadsAPI = new ThreadsAPI({
@@ -80,7 +78,8 @@ async function processQueue() {
           httpsAgent: proxyAgent,
           headers: {
             'x-csrftoken': task.csrftoken,
-            'Cookie': cookieString // ★修正ポイント
+            'Cookie': cookieString,
+            'User-Agent': task.ua // ★ワーカー側もUAを設定
           }
         },
       });
