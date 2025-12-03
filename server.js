@@ -8,15 +8,9 @@ app.use(express.json());
 const requestQueue = [];
 let isProcessing = false;
 
-// Cookie値の抽出
-function getCookieValue(cookieString, key) {
-  if (!cookieString) return null;
-  const match = cookieString.match(new RegExp('(^|;\\s*)' + key + '=([^;]*)'));
-  if (match && match[2]) return decodeURIComponent(match[2]);
-  return null;
-}
-
-// プロキシ形式変換
+// ---------------------------------------------------------
+//  プロキシ形式変換 (host:port:user:pass -> http://...)
+// ---------------------------------------------------------
 function formatProxy(proxyStr) {
   if (!proxyStr) return null;
   if (proxyStr.startsWith("http")) return proxyStr;
@@ -28,29 +22,74 @@ function formatProxy(proxyStr) {
   return proxyStr;
 }
 
-// ブラウザ偽装ヘッダー作成
-function createWebHeaders(ua, fullCookie, csrftoken) {
-  return {
+// ---------------------------------------------------------
+//  WEBブラウザ用ヘッダー生成 (sessionid一本勝負)
+// ---------------------------------------------------------
+function createWebHeaders(ua, sessionid, csrftoken, lsd = null) {
+  // sessionidの%3Aなどをデコード
+  const cleanSessionId = decodeURIComponent(sessionid);
+  
+  const headers = {
     'User-Agent': ua,
-    'Cookie': fullCookie,
-    'x-csrftoken': csrftoken,
-    'x-ig-app-id': '238260118697367',
+    'Cookie': `sessionid=${cleanSessionId}`, // 余計なものは混ぜない
+    'x-ig-app-id': '238260118697367', // WEB版AppID
     'x-asbd-id': '129477',
     'Authority': 'www.threads.net',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+    'Accept': '*/*',
     'Accept-Language': 'en-US,en;q=0.9',
     'Cache-Control': 'no-cache',
-    'Sec-Fetch-Dest': 'document',
-    'Sec-Fetch-Mode': 'navigate',
-    'Sec-Fetch-Site': 'none',
-    'Sec-Fetch-User': '?1',
-    'Upgrade-Insecure-Requests': '1'
+    'Content-Type': 'application/x-www-form-urlencoded',
+    'Origin': 'https://www.threads.net',
+    'Referer': 'https://www.threads.net/',
+    'Sec-Fetch-Dest': 'empty',
+    'Sec-Fetch-Mode': 'cors',
+    'Sec-Fetch-Site': 'same-origin',
   };
+
+  if (csrftoken) {
+    headers['x-csrftoken'] = csrftoken;
+    headers['Cookie'] += `; csrftoken=${csrftoken}`;
+  }
+  
+  if (lsd) {
+    headers['x-fb-lsd'] = lsd;
+  }
+  
+  return headers;
 }
 
-// 1. ログイン確認 (HTML解析版)
+// ---------------------------------------------------------
+//  LSDトークンとUserIDをページから取得
+// ---------------------------------------------------------
+async function fetchPageData(username, agent, headers) {
+  try {
+    const response = await axios.get(`https://www.threads.net/@${username}`, {
+      httpsAgent: agent,
+      headers: headers,
+      proxy: false,
+      validateStatus: s => s < 500
+    });
+    
+    const html = response.data;
+    
+    // LSDを探す
+    const lsdMatch = html.match(/"LSD",\[\],{"token":"(.*?)"}/);
+    const lsd = lsdMatch ? lsdMatch[1] : null;
+
+    // UserIDを探す (ds_user_idがクッキーになくてもページから拾う)
+    const userIdMatch = html.match(/"user_id":"(\d+)"/);
+    const userId = userIdMatch ? userIdMatch[1] : null;
+
+    return { lsd, userId };
+  } catch (e) {
+    console.error("ページ取得エラー:", e.message);
+    return { lsd: null, userId: null };
+  }
+}
+
+// 1. ログイン確認
 app.post("/api/check", async (req, res) => {
-  const { username, fullCookie, ua, proxy } = req.body;
+  const { username, fullCookie, ua, proxy } = req.body; // I2の値を fullCookie として受け取る
   console.log(`[Login Check] ${username}`);
 
   if (!proxy || !fullCookie) return res.status(400).json({ status: "error", message: "情報不足" });
@@ -58,36 +97,19 @@ app.post("/api/check", async (req, res) => {
   try {
     const formattedProxy = formatProxy(proxy);
     const proxyAgent = new HttpsProxyAgent(formattedProxy);
-    const realCsrf = getCookieValue(fullCookie, "csrftoken");
-    const headers = createWebHeaders(ua, fullCookie, realCsrf);
-
-    const targetUrl = `https://www.threads.net/@${username}`;
     
-    // HTMLを取得
-    const response = await axios.get(targetUrl, {
-      httpsAgent: proxyAgent,
-      headers: headers,
-      proxy: false,
-      validateStatus: status => status < 500
-    });
+    // I2セルの中身をそのまま sessionid として扱う
+    const sessionid = fullCookie.trim(); 
 
-    console.log(`Response Status: ${response.status}`);
+    // まずページにアクセスして生存確認
+    // (CSRFトークンは初回は無くてもGETなら通ることが多い)
+    const headers = createWebHeaders(ua, sessionid, null);
+    const { lsd, userId } = await fetchPageData(username, proxyAgent, headers);
 
-    if (response.status === 200) {
-      // HTMLの中にユーザー名が含まれているかチェック
-      // (ログインしていれば、自分のアイコン画像URLや設定データなどが含まれるはず)
-      // 簡易チェックとして、レスポンスサイズが十分にあればOKとする
-      const htmlLength = response.data.length;
-      
-      if (htmlLength > 5000) {
-         res.json({ status: "success", message: `★ページ取得成功！ (Size: ${htmlLength} bytes)` });
-      } else {
-         res.json({ status: "success", message: "★通信成功 (ただしページが空に近い)" });
-      }
-    } else if (response.status === 404) {
-      res.status(404).json({ status: "error", message: "ページが見つかりません (404)" });
+    if (lsd) {
+      res.json({ status: "success", message: `★ログイン成功！ (LSD取得OK)` });
     } else {
-      res.status(response.status).json({ status: "error", message: `ステータス異常: ${response.status}` });
+      res.status(403).json({ status: "error", message: "ページにアクセスできませんでした(403)。Cookieが無効かプロキシ拒否。" });
     }
 
   } catch (error) {
@@ -100,13 +122,12 @@ app.post("/api/check", async (req, res) => {
 app.post("/api/enqueue", (req, res) => {
   const { username, fullCookie, text, deviceId, imageUrl, ua, proxy } = req.body;
   requestQueue.push({ username, fullCookie, text, deviceId, imageUrl, ua, proxy });
-  console.log(`[受付] ${username} を予約`);
+  console.log(`[受付] ${username}`);
   res.json({ status: "queued", message: "予約完了" });
   processQueue();
 });
 
-// 3. 処理ワーカー (脱ライブラリ・GraphQL投稿版)
-// ★前回の投稿成功ロジック(LSD取得→GraphQL)をここに実装します
+// 3. 処理ワーカー
 async function processQueue() {
   if (isProcessing || requestQueue.length === 0) return;
   isProcessing = true;
@@ -118,48 +139,44 @@ async function processQueue() {
     try {
       const formattedProxy = formatProxy(task.proxy);
       const proxyAgent = new HttpsProxyAgent(formattedProxy);
-      const realCsrf = getCookieValue(task.fullCookie, "csrftoken");
-      const userID = getCookieValue(task.fullCookie, "ds_user_id");
+      
+      // I2セルの値をsessionidとして使用
+      const sessionid = task.fullCookie.trim();
 
-      // 1. LSDトークンを取得 (Topページからスクレイピング)
-      let headers = createWebHeaders(task.ua, task.fullCookie, realCsrf);
-      const pageRes = await axios.get(`https://www.threads.net/@${task.username}`, {
-        httpsAgent: proxyAgent,
-        headers: headers,
-        proxy: false
-      });
+      // 1. LSDとUserIDを取得
+      let headers = createWebHeaders(task.ua, sessionid, null);
+      const { lsd, userId } = await fetchPageData(task.username, proxyAgent, headers);
       
-      // LSDを探す
-      const lsdMatch = pageRes.data.match(/"LSD",\[\],{"token":"(.*?)"}/);
-      const lsd = lsdMatch ? lsdMatch[1] : null;
-      
-      if (!lsd) throw new Error("LSDトークンが見つかりませんでした");
-      console.log(`LSD取得: ${lsd}`);
+      if (!lsd) throw new Error("LSDトークン取得失敗");
+      if (!userId) throw new Error("UserID取得失敗");
+
+      console.log(`準備OK: LSD=${lsd.substring(0,5)}..., UserID=${userId}`);
 
       // 2. 投稿 (GraphQL)
-      // ヘッダーにLSDを追加
-      headers['x-fb-lsd'] = lsd;
+      headers = createWebHeaders(task.ua, sessionid, null, lsd);
       headers['x-fb-friendly-name'] = 'BarcelonaCreatePostMutation';
 
       const postPayload = new URLSearchParams();
       postPayload.append('lsd', lsd);
       postPayload.append('variables', JSON.stringify({
-        userID: userID,
+        userID: userId,
         text: task.text,
         publicationOpt: "any_user",
-        // 画像がある場合は添付処理が必要ですが、まずはテキスト
         attachmentUtils: null
       }));
-      postPayload.append('doc_id', '23980155133315596'); // Web版 CreatePost ID
+      postPayload.append('doc_id', '23980155133315596');
 
-      const postRes = await axios.post("https://www.threads.net/api/graphql", postPayload, {
+      const response = await axios.post("https://www.threads.net/api/graphql", postPayload, {
         httpsAgent: proxyAgent,
         headers: headers,
         proxy: false
       });
 
-      console.log("投稿レスポンス:", JSON.stringify(postRes.data));
-      console.log(`✅ 投稿完了: ${task.username}`);
+      if (response.data.errors) {
+         console.error("GraphQLErrors:", JSON.stringify(response.data.errors));
+      } else {
+         console.log(`✅ 投稿成功: ${task.username}`);
+      }
 
     } catch (error) {
       console.error(`❌ 投稿失敗 (${task.username}):`, error.message);
