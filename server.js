@@ -8,7 +8,17 @@ app.use(express.json());
 const requestQueue = [];
 let isProcessing = false;
 
-// 1. 厳密なログイン確認
+// -------------------------------------------
+//  Cookie文字列から特定のキーの値を抜き出す便利関数
+// -------------------------------------------
+function getCookieValue(cookieString, key) {
+  if (!cookieString) return null;
+  const match = cookieString.match(new RegExp('(^| )' + key + '=([^;]+)'));
+  if (match) return match[2];
+  return null;
+}
+
+// 1. ログイン確認
 app.post("/api/check", async (req, res) => {
   const { username, fullCookie, deviceId, ua, proxy } = req.body;
   console.log(`[Login Check] ${username}`);
@@ -20,37 +30,46 @@ app.post("/api/check", async (req, res) => {
   try {
     const proxyAgent = new HttpsProxyAgent(proxy);
     
+    // ★修正: fullCookieの中から sessionid を探し出す
+    const sessionid = getCookieValue(fullCookie, "sessionid");
+    
+    if (!sessionid) {
+      throw new Error("Cookie文字列の中に sessionid が見つかりません。");
+    }
+
+    console.log(`SessionID抽出成功: ${sessionid.substring(0, 5)}...`);
+
     const threadsAPI = new ThreadsAPI({
       username: username,
-      token: "dummy",
+      token: sessionid, // ★ダミーではなく、本物を渡す！
       deviceID: deviceId,
       axiosConfig: { 
         httpAgent: proxyAgent, 
         httpsAgent: proxyAgent,
         headers: {
-          'Cookie': fullCookie,
+          'Cookie': fullCookie, // ヘッダーには全部乗せ
           'User-Agent': ua
         }
       },
     });
 
-    // ① まずユーザーIDを取得
+    // ユーザーIDを取得
     const userID = await threadsAPI.getUserIDfromUsername(username);
     
-    // ② 【ここが追加】 実際にプロフィール情報を取得して、アクセス権があるかテストする
-    // Cookieが無効、またはIPが不一致なら、ここで「403エラー」が出るはずです
-    await threadsAPI.getUserProfile(userID);
-
-    res.json({ status: "success", message: `★ログイン状態よし！ UserID: ${userID}` });
+    // 実際にプロフィールを取得してログイン検証
+    // (ログインしていないとここでエラーになるか、nullが返る)
+    const profile = await threadsAPI.getUserProfile(userID);
+    
+    res.json({ status: "success", message: `ログイン成功！ Name: ${profile.username} (ID: ${userID})` });
 
   } catch (error) {
     console.error(`[Login Check] 失敗: ${error.message}`);
-    // エラー詳細があればログに出す
+    // エラー詳細
     if (error.response) {
       console.log(JSON.stringify(error.response.data));
-      // 403 Forbidden なら明確に伝える
-      if (error.response.status === 403 || error.message.includes("Login")) {
-        return res.status(403).json({ status: "error", message: "【重要】Cookieが無効、またはプロキシIPが一致していません。強制ログアウトされています。" });
+      // 403やリダイレクト等の場合
+      if (error.response.status === 403 || error.response.status === 302) {
+         return res.status(403).json({ status: "error", message: "プロキシIP不一致またはCookie無効で弾かれました。" });
       }
     }
     res.status(500).json({ status: "error", message: error.message });
@@ -77,11 +96,14 @@ async function processQueue() {
 
     try {
       const proxyAgent = new HttpsProxyAgent(task.proxy);
+      
+      // ★修正: ワーカー側も sessionid を抽出して渡す
+      const sessionid = getCookieValue(task.fullCookie, "sessionid");
 
       const threadsAPI = new ThreadsAPI({
         username: task.username,
-        token: "dummy",
-        deviceID: task.deviceId,
+        token: sessionid || "dummy", // 万が一抽出できなくても落ちはしないように
+        deviceID: task.deviceID,
         axiosConfig: { 
           httpAgent: proxyAgent, 
           httpsAgent: proxyAgent,
