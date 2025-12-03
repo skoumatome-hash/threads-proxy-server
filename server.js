@@ -9,14 +9,12 @@ const requestQueue = [];
 let isProcessing = false;
 
 // ---------------------------------------------------------
-//  Cookie文字列から値を精密に抜き出す関数 (デコード対応)
+//  Cookie文字列から値を精密に抜き出す関数
 // ---------------------------------------------------------
 function getCookieValue(cookieString, key) {
   if (!cookieString) return null;
-  // "key=value" または " key=value" を探す正規表現
   const match = cookieString.match(new RegExp('(^|;\\s*)' + key + '=([^;]*)'));
   if (match && match[2]) {
-    // %3A などをデコードして返す
     return decodeURIComponent(match[2]);
   }
   return null;
@@ -34,48 +32,45 @@ app.post("/api/check", async (req, res) => {
   try {
     const proxyAgent = new HttpsProxyAgent(proxy);
     
-    // ★修正: fullCookieから必要な「鍵」を現地で抽出する
-    const realSessionId = getCookieValue(fullCookie, "sessionid");
-    const realDeviceId = getCookieValue(fullCookie, "ig_did") || deviceId; // なければGASからのIDを使う
+    // ★修正: Cookieの中から必要な情報を全部現地調達する
+    const sessionid = getCookieValue(fullCookie, "sessionid");
+    const userID = getCookieValue(fullCookie, "ds_user_id"); // ★ここが追加！CookieからIDを抜く
     const realCsrf = getCookieValue(fullCookie, "csrftoken");
 
-    if (!realSessionId) {
-      throw new Error("Cookie文字列から sessionid が抽出できませんでした。");
+    if (!sessionid || !userID) {
+      throw new Error("Cookieから sessionid または ds_user_id が抽出できませんでした。");
     }
 
-    console.log(`Using SessionID: ${realSessionId.substring(0, 5)}...`);
+    console.log(`ID抽出成功: UserID=${userID}, Session=${sessionid.substring(0, 5)}...`);
 
-    // ★修正: 正攻法でインスタンス化（ダミーは使わない）
     const threadsAPI = new ThreadsAPI({
       username: username,
-      token: realSessionId,  // ★本物のセッションID
-      deviceID: realDeviceId, // ★本物のデバイスID
+      token: sessionid,
+      deviceID: deviceId,
       axiosConfig: { 
         httpAgent: proxyAgent, 
         httpsAgent: proxyAgent,
         headers: {
-          'User-Agent': ua,       // ★ADSPOWERのUA
-          'Cookie': fullCookie,   // ★ADSPOWERの全Cookie
-          'x-csrftoken': realCsrf // ★CSRFトークン
+          'User-Agent': ua,
+          'Cookie': fullCookie,
+          'x-csrftoken': realCsrf
         }
       },
     });
 
-    // ユーザーIDを取得
-    const userID = await threadsAPI.getUserIDfromUsername(username);
-    
-    // プロフィール取得でログイン検証
+    // ★修正: エラーが出る「ID検索」はやめて、持ってるIDで直接プロフィールを見る
     const profile = await threadsAPI.getUserProfile(userID);
     
-    res.json({ status: "success", message: `★ログイン成功！ Name: ${profile.username}` });
+    // ここまで来れば完全にログインできています
+    res.json({ status: "success", message: `★完全突破！ Name: ${profile.username}` });
 
   } catch (error) {
     console.error(`[Login Check] 失敗: ${error.message}`);
+    // もし403やリダイレクトなら、Cookie自体が死んでいる
     if (error.response) {
       console.log(JSON.stringify(error.response.data));
-      // 403 Forbiddenなどの場合
       if (error.response.status === 403) {
-         return res.status(403).json({ status: "error", message: "アクセス拒否(403): IP不一致またはCookie無効" });
+         return res.status(403).json({ status: "error", message: "Cookieが無効か、IP不一致で弾かれています(403)" });
       }
     }
     res.status(500).json({ status: "error", message: error.message });
@@ -103,15 +98,13 @@ async function processQueue() {
     try {
       const proxyAgent = new HttpsProxyAgent(task.proxy);
       
-      // ワーカー側でも抽出
-      const realSessionId = getCookieValue(task.fullCookie, "sessionid");
-      const realDeviceId = getCookieValue(task.fullCookie, "ig_did") || task.deviceId;
+      const sessionid = getCookieValue(task.fullCookie, "sessionid");
       const realCsrf = getCookieValue(task.fullCookie, "csrftoken");
 
       const threadsAPI = new ThreadsAPI({
         username: task.username,
-        token: realSessionId,
-        deviceID: realDeviceId,
+        token: sessionid,
+        deviceID: task.deviceId,
         axiosConfig: { 
           httpAgent: proxyAgent, 
           httpsAgent: proxyAgent,
@@ -128,9 +121,6 @@ async function processQueue() {
 
     } catch (error) {
       console.error(`❌ 投稿失敗 (${task.username}):`, error.message);
-      if (error.response) {
-        console.log(JSON.stringify(error.response.data));
-      }
     }
 
     if (requestQueue.length > 0) {
