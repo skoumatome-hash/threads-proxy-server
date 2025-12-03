@@ -9,48 +9,7 @@ const requestQueue = [];
 let isProcessing = false;
 
 // ---------------------------------------------------------
-//  Cookie解析
-// ---------------------------------------------------------
-function parseCookieInput(input) {
-  let sessionid = null;
-  let userID = null;
-  let deviceId = null;
-  let csrftoken = null;
-  let headerString = "";
-
-  if (!input) return { sessionid, userID, deviceId, headerString };
-
-  const trimmed = input.trim();
-
-  if (trimmed.startsWith("[") || trimmed.startsWith("{")) {
-    try {
-      const cookies = JSON.parse(trimmed);
-      const cookieParts = [];
-      if (Array.isArray(cookies)) {
-        cookies.forEach(c => {
-          if (c.name === "sessionid") sessionid = decodeURIComponent(c.value);
-          if (c.name === "ds_user_id") userID = c.value;
-          if (c.name === "ig_did") deviceId = c.value;
-          if (c.name === "csrftoken") csrftoken = c.value;
-          cookieParts.push(`${c.name}=${c.value}`);
-        });
-        headerString = cookieParts.join("; ");
-      }
-    } catch (e) { console.error(e); }
-  } else {
-    headerString = trimmed;
-    const sessionMatch = trimmed.match(/(^|;\s*)sessionid=([^;]*)/);
-    if (sessionMatch) sessionid = decodeURIComponent(sessionMatch[2]);
-    const userMatch = trimmed.match(/(^|;\s*)ds_user_id=([^;]*)/);
-    if (userMatch) userID = userMatch[2];
-    const csrfMatch = trimmed.match(/(^|;\s*)csrftoken=([^;]*)/);
-    if (csrfMatch) csrftoken = csrfMatch[2];
-  }
-  return { sessionid, userID, deviceId, csrftoken, headerString };
-}
-
-// ---------------------------------------------------------
-//  プロキシ変換
+//  プロキシ形式変換
 // ---------------------------------------------------------
 function formatProxy(proxyStr) {
   if (!proxyStr) return null;
@@ -64,14 +23,67 @@ function formatProxy(proxyStr) {
 }
 
 // ---------------------------------------------------------
-//  WEB用ヘッダー生成 (AppIDはWeb用のものに固定)
+//  Cookieを「再構築」する関数 (JSON -> String)
 // ---------------------------------------------------------
-function createWebHeaders(ua, fullCookie, csrftoken) {
-  return {
+function reconstructCookie(input) {
+  let cookieString = "";
+  let sessionid = "";
+  let userID = "";
+  let csrftoken = "";
+
+  if (!input) return { cookieString, sessionid, userID, csrftoken };
+
+  const trimmed = input.trim();
+
+  // JSONの場合
+  if (trimmed.startsWith("[") || trimmed.startsWith("{")) {
+    try {
+      const cookies = JSON.parse(trimmed);
+      const parts = [];
+      
+      if (Array.isArray(cookies)) {
+        cookies.forEach(c => {
+          // 必要な値を確保
+          if (c.name === "sessionid") sessionid = decodeURIComponent(c.value);
+          if (c.name === "ds_user_id") userID = c.value;
+          if (c.name === "csrftoken") csrftoken = c.value;
+
+          // 全てのCookieを "key=value" にして追加
+          // 値はエンコードされたまま使うのが安全
+          parts.push(`${c.name}=${c.value}`);
+        });
+      }
+      cookieString = parts.join("; ");
+
+    } catch (e) {
+      console.error("JSON解析失敗:", e.message);
+    }
+  } else {
+    // すでに文字列の場合
+    cookieString = trimmed;
+    const sessMatch = trimmed.match(/sessionid=([^;]+)/);
+    if (sessMatch) sessionid = decodeURIComponent(sessMatch[1]);
+    
+    const userMatch = trimmed.match(/ds_user_id=([^;]+)/);
+    if (userMatch) userID = userMatch[1];
+
+    const csrfMatch = trimmed.match(/csrftoken=([^;]+)/);
+    if (csrfMatch) csrftoken = csrfMatch[1];
+  }
+
+  return { cookieString, sessionid, userID, csrftoken };
+}
+
+
+// ---------------------------------------------------------
+//  WEBブラウザ用ヘッダー生成
+// ---------------------------------------------------------
+function createWebHeaders(ua, cookieString, csrftoken, lsd = null) {
+  const headers = {
     'User-Agent': ua,
-    'Cookie': fullCookie,
+    'Cookie': cookieString,
     'x-csrftoken': csrftoken,
-    'x-ig-app-id': '238260118697367', // ★Web版のAppID (超重要)
+    'x-ig-app-id': '238260118697367',
     'x-asbd-id': '129477',
     'Authority': 'www.threads.net',
     'Accept': '*/*',
@@ -84,19 +96,21 @@ function createWebHeaders(ua, fullCookie, csrftoken) {
     'Sec-Fetch-Mode': 'cors',
     'Sec-Fetch-Site': 'same-origin',
   };
+  
+  if (lsd) headers['x-fb-lsd'] = lsd;
+  
+  return headers;
 }
 
-// ---------------------------------------------------------
-//  LSD取得関数 (Webページからスクレイピング)
-// ---------------------------------------------------------
+// LSD取得
 async function fetchLsdToken(username, agent, headers) {
   try {
     const response = await axios.get(`https://www.threads.net/@${username}`, {
       httpsAgent: agent,
       headers: headers,
-      proxy: false
+      proxy: false,
+      validateStatus: s => s < 500
     });
-    // LSDトークンを探す正規表現
     const match = response.data.match(/"LSD",\[\],{"token":"(.*?)"}/);
     return match ? match[1] : null;
   } catch (e) {
@@ -115,14 +129,16 @@ app.post("/api/check", async (req, res) => {
   try {
     const formattedProxy = formatProxy(proxy);
     const proxyAgent = new HttpsProxyAgent(formattedProxy);
-    const { userID, headerString, csrftoken } = parseCookieInput(fullCookie);
+    
+    // ★Cookie再構築
+    const { cookieString, userID, csrftoken } = reconstructCookie(fullCookie);
 
-    if (!userID) return res.status(400).json({ status: "error", message: "UserIDが特定できません" });
+    if (!userID) return res.status(400).json({ status: "error", message: "UserIDがCookieにありません" });
 
     // Webとしてアクセス
-    const headers = createWebHeaders(ua, headerString, csrftoken);
+    const headers = createWebHeaders(ua, cookieString, csrftoken);
     
-    // 単純なGETリクエストでセッション確認
+    // ログイン確認のためにプロフィールへ
     const targetUrl = `https://www.threads.net/@${username}`;
     const response = await axios.get(targetUrl, {
       httpsAgent: proxyAgent,
@@ -132,7 +148,13 @@ app.post("/api/check", async (req, res) => {
     });
 
     if (response.status === 200) {
-      res.json({ status: "success", message: `★WEB接続成功！ (ID: ${userID})` });
+      // HTML内に「ログイン」ボタンがあるかチェック（あれば失敗）
+      if (response.data.includes('class="x1i10hfl x1qjc9v5')) { // ログインボタンの特徴的なクラス
+         // 怪しいが、200なので一応成功として返す（投稿で白黒つく）
+         res.json({ status: "success", message: `★接続成功 (ID: ${userID}) ※投稿を試してください` });
+      } else {
+         res.json({ status: "success", message: `★完全ログインOK (ID: ${userID})` });
+      }
     } else {
       res.status(response.status).json({ status: "error", message: `ステータス異常: ${response.status}` });
     }
@@ -152,7 +174,7 @@ app.post("/api/enqueue", (req, res) => {
   processQueue();
 });
 
-// 3. 処理ワーカー (GraphQL Web投稿)
+// 3. 処理ワーカー
 async function processQueue() {
   if (isProcessing || requestQueue.length === 0) return;
   isProcessing = true;
@@ -164,19 +186,23 @@ async function processQueue() {
     try {
       const formattedProxy = formatProxy(task.proxy);
       const proxyAgent = new HttpsProxyAgent(formattedProxy);
-      const { userID, headerString, csrftoken } = parseCookieInput(task.fullCookie);
+      
+      // ★Cookie再構築
+      const { cookieString, userID, csrftoken } = reconstructCookie(task.fullCookie);
 
-      // 1. LSDトークンを取得
+      // 1. LSD取得
       console.log("LSDトークン取得中...");
-      let headers = createWebHeaders(task.ua, headerString, csrftoken);
+      let headers = createWebHeaders(task.ua, cookieString, csrftoken);
       const lsd = await fetchLsdToken(task.username, proxyAgent, headers);
       
-      if (!lsd) throw new Error("LSDトークンが見つかりません(ログイン無効の可能性)");
+      if (!lsd) {
+        console.log("LSD取得失敗。ログインページに飛ばされた可能性があります。");
+        throw new Error("LSDトークン取得エラー");
+      }
       console.log(`LSD: ${lsd}`);
 
-      // 2. 投稿リクエスト作成 (GraphQL)
-      // ヘッダーにLSDを追加
-      headers['x-fb-lsd'] = lsd;
+      // 2. 投稿 (GraphQL)
+      headers = createWebHeaders(task.ua, cookieString, csrftoken, lsd);
       headers['x-fb-friendly-name'] = 'BarcelonaCreatePostMutation';
 
       const postPayload = new URLSearchParams();
@@ -187,9 +213,8 @@ async function processQueue() {
         publicationOpt: "any_user",
         attachmentUtils: null
       }));
-      postPayload.append('doc_id', '23980155133315596'); // Web版投稿用ID
+      postPayload.append('doc_id', '23980155133315596');
 
-      // 3. 実行
       console.log("投稿リクエスト送信(GraphQL)...");
       const response = await axios.post("https://www.threads.net/api/graphql", postPayload, {
         httpsAgent: proxyAgent,
@@ -197,18 +222,18 @@ async function processQueue() {
         proxy: false
       });
 
-      // レスポンスチェック
-      if (response.data && response.data.data && response.data.data.xfb_create_threads_post_content) {
+      // レスポンス解析
+      if (response.data.data && response.data.data.xfb_create_threads_post_content) {
          console.log(`✅ 投稿成功: ${task.username}`);
       } else if (response.data.errors) {
          console.error("GraphQL Errors:", JSON.stringify(response.data.errors));
       } else {
-         console.log("不明なレスポンス:", JSON.stringify(response.data));
+         // HTMLが返ってきた場合などはここに来る
+         console.log("不明なレスポンス (ログイン切れの可能性):", response.data.substring(0, 100));
       }
 
     } catch (error) {
       console.error(`❌ 投稿失敗 (${task.username}):`, error.message);
-      if (error.response) console.log(JSON.stringify(error.response.data));
     }
 
     if (requestQueue.length > 0) {
