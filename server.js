@@ -5,44 +5,40 @@ const app = express();
 
 app.use(express.json());
 
-// ▼▼▼ 固定プロキシ設定は削除済み（GASから受け取るため） ▼▼▼
+// ▼▼▼ プロキシ設定はGASから受け取るため削除済み ▼▼▼
 
 const requestQueue = [];
 let isProcessing = false;
 
 // 1. ログイン確認
 app.post("/api/check", async (req, res) => {
-  const { username, token, deviceId, csrftoken, ua, proxy } = req.body;
+  const { username, fullCookie, deviceId, ua, proxy } = req.body;
   console.log(`[Login Check] ${username}`);
 
-  if (!proxy) {
-    return res.status(400).json({ status: "error", message: "プロキシ情報(L列)がありません" });
+  if (!proxy || !fullCookie) {
+    return res.status(400).json({ status: "error", message: "プロキシまたはCookie情報が不足しています" });
   }
 
   try {
     const proxyAgent = new HttpsProxyAgent(proxy);
-    const cookieString = `sessionid=${token}; csrftoken=${csrftoken}`;
-
+    
+    // ★修正: GASから受け取った「完全なCookie」をそのままセットする
     const threadsAPI = new ThreadsAPI({
       username: username,
-      token: token, 
+      token: "dummy", // ライブラリの必須項目なのでダミーを入れる（実際はヘッダーで上書き）
       deviceID: deviceId,
       axiosConfig: { 
         httpAgent: proxyAgent, 
         httpsAgent: proxyAgent,
         headers: {
-          'x-csrftoken': csrftoken,
-          'Cookie': cookieString,
+          'Cookie': fullCookie, // ★ここでADSPOWERの全Cookieを渡す
           'User-Agent': ua
         }
       },
     });
 
-    // ★修正：確実に動くメソッドに戻しました
     const userID = await threadsAPI.getUserIDfromUsername(username);
-    
-    // ここまでエラーなく来れば、プロキシ接続とヘッダー設定は成功しています
-    res.json({ status: "success", message: `接続テスト成功！ UserID: ${userID}` });
+    res.json({ status: "success", message: `完全ログイン成功！ UserID: ${userID}` });
 
   } catch (error) {
     console.error(`[Login Check] 失敗: ${error.message}`);
@@ -53,13 +49,8 @@ app.post("/api/check", async (req, res) => {
 
 // 2. 予約受付
 app.post("/api/enqueue", (req, res) => {
-  const { username, token, text, deviceId, imageUrl, csrftoken, ua, proxy } = req.body;
-  
-  if (!proxy) {
-    return res.status(400).json({ status: "error", message: "プロキシ情報(L列)が不足しています" });
-  }
-
-  requestQueue.push({ username, token, text, deviceId, imageUrl, csrftoken, ua, proxy });
+  const { username, fullCookie, text, deviceId, imageUrl, ua, proxy } = req.body;
+  requestQueue.push({ username, fullCookie, text, deviceId, imageUrl, ua, proxy });
   console.log(`[受付] ${username} を予約`);
   res.json({ status: "queued", message: "予約完了" });
   processQueue();
@@ -76,18 +67,16 @@ async function processQueue() {
 
     try {
       const proxyAgent = new HttpsProxyAgent(task.proxy);
-      const cookieString = `sessionid=${task.token}; csrftoken=${task.csrftoken}`;
 
       const threadsAPI = new ThreadsAPI({
         username: task.username,
-        token: task.token, 
+        token: "dummy",
         deviceID: task.deviceId,
         axiosConfig: { 
           httpAgent: proxyAgent, 
           httpsAgent: proxyAgent,
           headers: {
-            'x-csrftoken': task.csrftoken,
-            'Cookie': cookieString,
+            'Cookie': task.fullCookie, // ★完全なCookieを使用
             'User-Agent': task.ua
           }
         },
