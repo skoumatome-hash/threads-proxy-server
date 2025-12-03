@@ -21,7 +21,7 @@ function parseCookies(input) {
           cookies.push({
             name: c.name,
             value: c.value,
-            domain: ".threads.net", // 強制的にthreads.netにする
+            domain: ".threads.net",
             path: "/",
             secure: true,
             httpOnly: c.httpOnly !== undefined ? c.httpOnly : true
@@ -75,7 +75,7 @@ async function runPuppeteerPost(task) {
       '--single-process',
       '--no-zygote',
       '--disable-notifications',
-      '--window-size=1280,800' // ★ウィンドウサイズを固定
+      '--window-size=1920,1080' // PCサイズを大きく確保
     ];
 
     if (proxyData) {
@@ -85,19 +85,15 @@ async function runPuppeteerPost(task) {
 
     browser = await puppeteer.launch({ args: args, headless: "new" });
     const page = await browser.newPage();
-
-    // ★重要: 画面サイズをPC用にする
-    await page.setViewport({ width: 1280, height: 800 });
+    await page.setViewport({ width: 1920, height: 1080 });
 
     if (proxyData && proxyData.username) {
       await page.authenticate({ username: proxyData.username, password: proxyData.password });
       console.log("🔑 プロキシ認証設定完了");
     }
 
-    // UA設定 (Windows Chromeのふり)
     await page.setUserAgent(task.ua || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36");
 
-    // Cookieセット
     const cookies = parseCookies(task.fullCookie);
     if (cookies.length > 0) {
       await page.setCookie(...cookies);
@@ -105,55 +101,79 @@ async function runPuppeteerPost(task) {
     }
 
     console.log("🌍 Threadsにアクセス中...");
-    await page.goto("https://www.threads.net/", { waitUntil: 'networkidle2', timeout: 60000 });
+    await page.goto("https://www.threads.net/", { waitUntil: 'networkidle2', timeout: 90000 });
 
-    // ★デバッグ: 今、画面に何が表示されているか確認する
+    // 画面チェック
     const pageTitle = await page.title();
-    const bodyText = await page.evaluate(() => document.body.innerText.substring(0, 200).replace(/\n/g, ' '));
-    console.log(`👀 現在のページタイトル: ${pageTitle}`);
-    console.log(`👀 画面内のテキスト(先頭): ${bodyText}`);
+    console.log(`👀 ページタイトル: ${pageTitle}`);
 
-    // ログイン判定
-    // "Start a thread" (投稿エリア) があるか？
-    // なければ "Log in" ボタンがあるか？
-    const postInputSelector = 'div[data-lexical-editor="true"], div[role="textbox"]';
-    const loginButtonSelector = 'a[href*="login"], div[role="button"]';
+    // ★修正: 「Start a thread」または「スレッドを開始」という文字を探してクリックする
+    // CSSセレクタではなく、テキストの中身で探すので確実です
+    console.log("🔍 投稿エリアを探しています...");
+    
+    // 少し待つ
+    await new Promise(r => setTimeout(r, 5000));
 
-    try {
-      await page.waitForSelector(postInputSelector, { timeout: 15000 });
-      console.log("✅ ログイン確認OK (投稿エリア発見)");
-    } catch (e) {
-      // 投稿エリアが見つからない場合、ログインボタンがあるか確認
-      console.log("⚠️ 投稿エリアが見つかりません。ログイン状態を確認します...");
-      
-      const isLoginPage = await page.evaluate(() => {
-        return document.body.innerText.includes("Log in") || document.body.innerText.includes("Instagram");
-      });
+    const inputFound = await page.evaluate(() => {
+      // 画面内のすべての要素から、特定の文字を含むものを探す
+      const elements = Array.from(document.querySelectorAll('div, span, p'));
+      for (const el of elements) {
+        if (el.innerText === "Start a thread..." || el.innerText === "スレッドを開始..." || el.innerText.includes("Start a thread")) {
+          el.click(); // 見つけたら即クリック
+          return true;
+        }
+      }
+      return false;
+    });
 
-      if (isLoginPage) {
-        throw new Error("【ログイン失敗】 ログイン画面が表示されています。Cookieが無効か、IPが変わってログアウトされました。");
-      } else {
-        throw new Error(`【不明なエラー】 投稿エリアもログインボタンも見つかりません。画面テキスト: ${bodyText}`);
+    if (inputFound) {
+      console.log("✅ 投稿エリアを発見・クリックしました");
+    } else {
+      // 見つからない場合、ページ構造が変わっているか、英語設定かもしれない
+      // "Post"ボタンなどが押せる状態か確認するために、とりあえずtabキーを押してみる等の策もあるが
+      // ここでは汎用的なクラス名で再トライ
+      console.log("⚠️ テキストで見つかりませんでした。CSSセレクタで再トライします...");
+      try {
+        await page.waitForSelector('div[role="textbox"], div[data-lexical-editor="true"]', { timeout: 5000 });
+        await page.click('div[role="textbox"], div[data-lexical-editor="true"]');
+        console.log("✅ セレクタで投稿エリアをクリックしました");
+      } catch (e) {
+        // 最終確認: ログイン画面かどうか
+        const bodyText = await page.evaluate(() => document.body.innerText);
+        if (bodyText.includes("Log in with Instagram")) {
+          throw new Error("ログイン画面が表示されています。Cookieが無効です。");
+        }
+        console.log("現在の画面テキスト(抜粋): " + bodyText.substring(0, 100));
+        throw new Error("投稿エリアが見つかりませんでした。");
       }
     }
 
-    // 投稿処理
-    await page.click(postInputSelector);
     await new Promise(r => setTimeout(r, 2000));
 
     console.log("✍️ テキスト入力中...");
-    await page.type(postInputSelector, task.text, { delay: 100 });
+    // フォーカスされているはずなので、キーボード入力として送る
+    await page.keyboard.type(task.text, { delay: 50 });
     await new Promise(r => setTimeout(r, 3000));
 
-    // 投稿ボタンクリック
-    const [button] = await page.$x("//div[@role='button'][contains(., 'Post') or contains(., '投稿')]");
-    if (button) {
-      console.log("🔘 投稿ボタンをクリック...");
-      await button.click();
-      await new Promise(r => setTimeout(r, 8000));
-      console.log(`✅ 投稿成功: ${task.username}`);
+    // 「Post」ボタンをクリック
+    console.log("🔘 投稿ボタンを探しています...");
+    const postClicked = await page.evaluate(() => {
+      const buttons = Array.from(document.querySelectorAll('div[role="button"]'));
+      for (const btn of buttons) {
+        if (btn.innerText === "Post" || btn.innerText === "投稿") {
+          btn.click();
+          return true;
+        }
+      }
+      return false;
+    });
+
+    if (postClicked) {
+      console.log("✅ 投稿ボタンをクリックしました");
+      await new Promise(r => setTimeout(r, 8000)); // 完了待ち
+      console.log(`🎉 投稿処理完了: ${task.username}`);
     } else {
-      throw new Error("投稿ボタンが見つかりませんでした");
+      throw new Error("投稿ボタンが見つかりませんでした（入力は完了しています）");
     }
 
   } catch (error) {
