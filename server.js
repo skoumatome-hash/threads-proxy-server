@@ -13,7 +13,7 @@ app.use(express.json());
 
 // ▼▼▼ ここにあなたの5Gプロキシ情報を入れてください ▼▼▼
 // 形式: http://ユーザー名:パスワード@ホスト:ポート
-const PROXY_URL = "http://username:password@proxy-host:port"; 
+const PROXY_URL = "http://86a4c5a5d75ab064cd33__cr.jp:ae68af898d6ead3b@gw.dataimpulse.com:823"; 
 // ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
 
 // 待ち行列（キュー）
