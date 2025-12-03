@@ -7,7 +7,7 @@ const app = express();
 app.use(express.json());
 
 // ▼▼▼ あなたの5Gプロキシ情報 ▼▼▼
-const PROXY_URL = 'http://ここにプロキシ情報を入れる'; 
+const PROXY_URL = 'http://86a4c5a5d75ab064cd33__cr.jp:ae68af898d6ead3b@gw.dataimpulse.com:823';
 // ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
 
 const requestQueue = [];
