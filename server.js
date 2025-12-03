@@ -75,7 +75,7 @@ async function runPuppeteerPost(task) {
       '--single-process',
       '--no-zygote',
       '--disable-notifications',
-      '--window-size=1920,1080' // PCサイズを大きく確保
+      '--window-size=1920,1080'
     ];
 
     if (proxyData) {
@@ -89,7 +89,6 @@ async function runPuppeteerPost(task) {
 
     if (proxyData && proxyData.username) {
       await page.authenticate({ username: proxyData.username, password: proxyData.password });
-      console.log("🔑 プロキシ認証設定完了");
     }
 
     await page.setUserAgent(task.ua || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36");
@@ -97,87 +96,76 @@ async function runPuppeteerPost(task) {
     const cookies = parseCookies(task.fullCookie);
     if (cookies.length > 0) {
       await page.setCookie(...cookies);
-      console.log(`🍪 Cookie ${cookies.length}個をセットしました`);
     }
 
     console.log("🌍 Threadsにアクセス中...");
     await page.goto("https://www.threads.net/", { waitUntil: 'networkidle2', timeout: 90000 });
 
-    // 画面チェック
-    const pageTitle = await page.title();
-    console.log(`👀 ページタイトル: ${pageTitle}`);
-
-    // ★修正: 「Start a thread」または「スレッドを開始」という文字を探してクリックする
-    // CSSセレクタではなく、テキストの中身で探すので確実です
-    console.log("🔍 投稿エリアを探しています...");
+    // ★修正: 「作成(Create)」ボタンを探してクリックする
+    // aria-label="Create" または href="/create" を探す
+    console.log("🔍 「作成」ボタンを探しています...");
     
-    // 少し待つ
-    await new Promise(r => setTimeout(r, 5000));
-
-    const inputFound = await page.evaluate(() => {
-      // 画面内のすべての要素から、特定の文字を含むものを探す
-      const elements = Array.from(document.querySelectorAll('div, span, p'));
-      for (const el of elements) {
-        if (el.innerText === "Start a thread..." || el.innerText === "スレッドを開始..." || el.innerText.includes("Start a thread")) {
-          el.click(); // 見つけたら即クリック
-          return true;
-        }
+    try {
+      // メニューバーが表示されるまで待つ
+      await page.waitForSelector('svg[aria-label="Create"], svg[aria-label="作成"]', { timeout: 20000 });
+      
+      // ボタンをクリック
+      const createBtn = await page.$('svg[aria-label="Create"], svg[aria-label="作成"]');
+      if (createBtn) {
+        console.log("✅ 「作成」ボタンをクリックしました");
+        await createBtn.click();
+      } else {
+        // SVGが見つからない場合、リンクを探す
+        console.log("⚠️ SVGが見つかりません。リンクを探します...");
+        await page.click('a[href="/create"]');
       }
-      return false;
-    });
-
-    if (inputFound) {
-      console.log("✅ 投稿エリアを発見・クリックしました");
-    } else {
-      // 見つからない場合、ページ構造が変わっているか、英語設定かもしれない
-      // "Post"ボタンなどが押せる状態か確認するために、とりあえずtabキーを押してみる等の策もあるが
-      // ここでは汎用的なクラス名で再トライ
-      console.log("⚠️ テキストで見つかりませんでした。CSSセレクタで再トライします...");
-      try {
-        await page.waitForSelector('div[role="textbox"], div[data-lexical-editor="true"]', { timeout: 5000 });
-        await page.click('div[role="textbox"], div[data-lexical-editor="true"]');
-        console.log("✅ セレクタで投稿エリアをクリックしました");
-      } catch (e) {
-        // 最終確認: ログイン画面かどうか
-        const bodyText = await page.evaluate(() => document.body.innerText);
-        if (bodyText.includes("Log in with Instagram")) {
-          throw new Error("ログイン画面が表示されています。Cookieが無効です。");
-        }
-        console.log("現在の画面テキスト(抜粋): " + bodyText.substring(0, 100));
-        throw new Error("投稿エリアが見つかりませんでした。");
-      }
+    } catch (e) {
+      // 万が一ボタンが見つからなくても、直接URLを叩いて投稿画面を開く
+      console.log("⚠️ ボタンが見つからないため、直接投稿ページへ移動します...");
+      await page.goto("https://www.threads.net/create", { waitUntil: 'networkidle2' });
     }
 
+    // 投稿モーダルが開くのを待つ
+    console.log("⏳ 投稿入力欄を待機中...");
+    const textBoxSelector = 'div[role="textbox"], div[data-lexical-editor="true"]';
+    await page.waitForSelector(textBoxSelector, { timeout: 15000 });
+    
+    // 入力
+    console.log("✍️ テキスト入力中...");
+    await page.click(textBoxSelector);
+    await new Promise(r => setTimeout(r, 1000));
+    await page.keyboard.type(task.text, { delay: 100 });
     await new Promise(r => setTimeout(r, 2000));
 
-    console.log("✍️ テキスト入力中...");
-    // フォーカスされているはずなので、キーボード入力として送る
-    await page.keyboard.type(task.text, { delay: 50 });
-    await new Promise(r => setTimeout(r, 3000));
-
-    // 「Post」ボタンをクリック
-    console.log("🔘 投稿ボタンを探しています...");
-    const postClicked = await page.evaluate(() => {
+    // 投稿ボタン (Post) を探してクリック
+    console.log("🔘 投稿実行ボタンを探しています...");
+    const postBtn = await page.evaluateHandle(() => {
+      // "Post" または "投稿" というテキストを持つボタンを探す
       const buttons = Array.from(document.querySelectorAll('div[role="button"]'));
-      for (const btn of buttons) {
-        if (btn.innerText === "Post" || btn.innerText === "投稿") {
-          btn.click();
-          return true;
-        }
-      }
-      return false;
+      return buttons.find(b => 
+        (b.innerText === "Post" || b.innerText === "投稿") && !b.getAttribute('disabled')
+      );
     });
 
-    if (postClicked) {
-      console.log("✅ 投稿ボタンをクリックしました");
-      await new Promise(r => setTimeout(r, 8000)); // 完了待ち
-      console.log(`🎉 投稿処理完了: ${task.username}`);
+    if (postBtn) {
+      await postBtn.click();
+      console.log("✅ ボタンをクリックしました！ 完了待ち...");
+      await new Promise(r => setTimeout(r, 10000)); // 投稿完了まで十分待つ
+      console.log(`🎉 投稿成功: ${task.username}`);
     } else {
-      throw new Error("投稿ボタンが見つかりませんでした（入力は完了しています）");
+      throw new Error("「投稿」ボタンが見つからないか、押せない状態です。");
     }
 
   } catch (error) {
     console.error(`❌ 処理失敗: ${error.message}`);
+    // デバッグ: 失敗時の画面テキストをログに出す
+    if (browser) {
+      const page = (await browser.pages())[0];
+      if (page) {
+        const bodyText = await page.evaluate(() => document.body.innerText.substring(0, 300).replace(/\n/g, ' '));
+        console.log(`(参考) 画面テキスト: ${bodyText}`);
+      }
+    }
     throw error;
   } finally {
     if (browser) {
