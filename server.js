@@ -1,6 +1,7 @@
 const express = require("express");
 const { HttpsProxyAgent } = require("https-proxy-agent");
 const axios = require("axios");
+const crypto = require("crypto"); // UUID生成用
 const app = express();
 
 app.use(express.json());
@@ -9,12 +10,11 @@ const requestQueue = [];
 let isProcessing = false;
 
 // ---------------------------------------------------------
-//  Cookieヘルパー関数群
+//  Cookieヘルパー
 // ---------------------------------------------------------
 function parseCookieInput(input) {
   let sessionid = null, userID = null, deviceId = null, csrftoken = null;
   let headerString = "";
-
   if (!input) return { sessionid, userID, deviceId, headerString };
   const trimmed = input.trim();
 
@@ -36,7 +36,7 @@ function parseCookieInput(input) {
   } else {
     headerString = trimmed;
     const sessMatch = trimmed.match(/(^|;\s*)sessionid=([^;]*)/);
-    if (sessMatch) sessionid = decodeURIComponent(sessMatch[2]);
+    if (sessMatch) sessionid = decodeURIComponent(sessMatch[1]);
     const userMatch = trimmed.match(/(^|;\s*)ds_user_id=([^;]*)/);
     if (userMatch) userID = userMatch[1];
     const csrfMatch = trimmed.match(/(^|;\s*)csrftoken=([^;]*)/);
@@ -45,37 +45,21 @@ function parseCookieInput(input) {
   return { sessionid, userID, deviceId, csrftoken, headerString };
 }
 
-// ★新機能: 古いCookieと新しいSet-Cookieをマージする
 function mergeCookies(oldCookieString, setCookieHeader) {
   if (!setCookieHeader || !Array.isArray(setCookieHeader)) return oldCookieString;
-  
   const cookieMap = new Map();
-  
-  // 1. 古いCookieをMapに入れる
   oldCookieString.split(';').forEach(c => {
     const [key, ...v] = c.trim().split('=');
     if (key) cookieMap.set(key, v.join('='));
   });
-
-  // 2. 新しいCookieで上書きする
   setCookieHeader.forEach(c => {
-    const [keyVal] = c.split(';'); // "key=value; Path=/..." の前だけ取る
+    const [keyVal] = c.split(';');
     const [key, ...v] = keyVal.trim().split('=');
     if (key) cookieMap.set(key, v.join('='));
   });
-
-  // 3. 文字列に戻す
   const parts = [];
-  for (const [key, value] of cookieMap) {
-    parts.push(`${key}=${value}`);
-  }
+  for (const [key, value] of cookieMap) parts.push(`${key}=${value}`);
   return parts.join('; ');
-}
-
-// Cookie文字列から特定の値を取り出す簡易関数
-function extractValueFromCookieString(cookieString, key) {
-  const match = cookieString.match(new RegExp('(^|;\\s*)' + key + '=([^;]*)'));
-  return match ? match[2] : null;
 }
 
 function formatProxy(proxyStr) {
@@ -145,7 +129,7 @@ app.post("/api/check", async (req, res) => {
 app.post("/api/enqueue", (req, res) => {
   const { username, fullCookie, text, deviceId, imageUrl, ua, proxy } = req.body;
   requestQueue.push({ username, fullCookie, text, deviceId, imageUrl, ua, proxy });
-  console.log(`[受付] ${username}`);
+  console.log(`[受付] ${username} を予約`);
   res.json({ status: "queued", message: "予約完了" });
   processQueue();
 });
@@ -166,10 +150,9 @@ async function processQueue() {
       // 1. 初期Cookie解析
       const { userID, headerString: initialCookie, csrftoken: initialCsrf } = parseCookieInput(task.fullCookie);
       
-      // 2. LSD取得 (GETリクエスト)
+      // 2. LSD取得
       console.log("LSDトークン取得中...");
       let headers = createWebHeaders(task.ua, initialCookie, initialCsrf);
-      
       const pageRes = await axios.get(`https://www.threads.net/@${task.username}`, {
         httpsAgent: proxyAgent,
         headers: headers,
@@ -178,35 +161,29 @@ async function processQueue() {
 
       const lsdMatch = pageRes.data.match(/"LSD",\[\],{"token":"(.*?)"}/);
       const lsd = lsdMatch ? lsdMatch[1] : null;
-      
-      if (!lsd) throw new Error("LSD取得失敗(ページ読み込みエラー)");
+      if (!lsd) throw new Error("LSD取得失敗");
       console.log(`LSD: ${lsd}`);
 
-      // ★重要: レスポンスヘッダーから新しいCookieを拾う
-      // Threadsはここで 'csrftoken' や 'datr' を更新してくることがある
+      // Cookie更新
       const setCookie = pageRes.headers['set-cookie'];
       const updatedCookieString = mergeCookies(initialCookie, setCookie);
       
-      // 新しいCookieからCSRFトークンを再取得 (変わっている可能性があるため)
-      const updatedCsrf = extractValueFromCookieString(updatedCookieString, "csrftoken") || initialCsrf;
-
-      console.log("Cookie継承完了。投稿へ...");
-
-      // 3. 投稿 (POSTリクエスト) - 更新されたCookieを使う
-      const postHeaders = createWebHeaders(task.ua, updatedCookieString, updatedCsrf, lsd);
+      // 3. 投稿 (POST)
+      const postHeaders = createWebHeaders(task.ua, updatedCookieString, initialCsrf, lsd);
       postHeaders['x-fb-friendly-name'] = 'BarcelonaCreatePostMutation';
 
       const postPayload = new URLSearchParams();
       postPayload.append('lsd', lsd);
+      // ★ここが修正点！ client_mutation_id を追加！
       postPayload.append('variables', JSON.stringify({
         userID: userID,
         text: task.text,
         publicationOpt: "any_user",
-        attachmentUtils: null
+        attachmentUtils: null,
+        client_mutation_id: crypto.randomUUID() // ★整理番号を付ける
       }));
       postPayload.append('doc_id', '23980155133315596');
 
-      // 少し待つ (人間らしさ)
       await new Promise(r => setTimeout(r, 2000));
 
       const postRes = await axios.post("https://www.threads.net/api/graphql", postPayload, {
@@ -215,19 +192,17 @@ async function processQueue() {
         proxy: false
       });
 
-      // 結果確認
       if (postRes.data?.data?.xfb_create_threads_post_content) {
          console.log(`✅ 投稿成功: ${task.username}`);
       } else {
-         console.log("投稿レスポンス(失敗):", JSON.stringify(postRes.data).substring(0, 200));
+         // エラー詳細をログに出す
+         console.log("投稿レスポンス(失敗):", JSON.stringify(postRes.data).substring(0, 500));
       }
 
     } catch (error) {
       console.error(`❌ 投稿失敗 (${task.username}):`, error.message);
-      if (error.response) console.log(JSON.stringify(error.response.data).substring(0, 200));
     }
 
-    // 休憩
     if (requestQueue.length > 0) {
       console.log("☕ 休憩中 (25秒)...");
       await new Promise((resolve) => setTimeout(resolve, 25000));
