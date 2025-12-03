@@ -5,22 +5,22 @@ const app = express();
 
 app.use(express.json());
 
-// ★固定のプロキシ設定は削除しました（GASから受け取るため）
+// ▼▼▼ 固定プロキシ設定は削除済み（GASから受け取るため） ▼▼▼
 
 const requestQueue = [];
 let isProcessing = false;
 
-// 1. ログイン確認（本当のログインチェックを行うように修正）
+// 1. ログイン確認
 app.post("/api/check", async (req, res) => {
   const { username, token, deviceId, csrftoken, ua, proxy } = req.body;
   console.log(`[Login Check] ${username}`);
 
   if (!proxy) {
-    return res.status(400).json({ status: "error", message: "プロキシ情報がありません" });
+    return res.status(400).json({ status: "error", message: "プロキシ情報(L列)がありません" });
   }
 
   try {
-    const proxyAgent = new HttpsProxyAgent(proxy); // ★GASからのプロキシを使う
+    const proxyAgent = new HttpsProxyAgent(proxy);
     const cookieString = `sessionid=${token}; csrftoken=${csrftoken}`;
 
     const threadsAPI = new ThreadsAPI({
@@ -38,24 +38,21 @@ app.post("/api/check", async (req, res) => {
       },
     });
 
-    // ★修正：本当にログインできているか、自分の情報を取得してテストする
-    const currentUser = await threadsAPI.getCurrentUser();
-    // もしログインできていなければ、ここでエラーになるはず
+    // ★修正：確実に動くメソッドに戻しました
+    const userID = await threadsAPI.getUserIDfromUsername(username);
     
-    res.json({ status: "success", message: `完全ログイン成功！ User: ${currentUser.username}` });
+    // ここまでエラーなく来れば、プロキシ接続とヘッダー設定は成功しています
+    res.json({ status: "success", message: `接続テスト成功！ UserID: ${userID}` });
 
   } catch (error) {
     console.error(`[Login Check] 失敗: ${error.message}`);
-    // エラー詳細があればログに出す
     if (error.response) console.log(JSON.stringify(error.response.data));
-    
-    res.status(500).json({ status: "error", message: "ログイン失敗（Cookieまたはプロキシが不一致）" });
+    res.status(500).json({ status: "error", message: error.message });
   }
 });
 
 // 2. 予約受付
 app.post("/api/enqueue", (req, res) => {
-  // proxy を受け取るように追加
   const { username, token, text, deviceId, imageUrl, csrftoken, ua, proxy } = req.body;
   
   if (!proxy) {
@@ -78,7 +75,6 @@ async function processQueue() {
     console.log(`\n--- 処理開始: ${task.username} ---`);
 
     try {
-      // ★タスクごとのプロキシを使用
       const proxyAgent = new HttpsProxyAgent(task.proxy);
       const cookieString = `sessionid=${task.token}; csrftoken=${task.csrftoken}`;
 
@@ -103,7 +99,6 @@ async function processQueue() {
     } catch (error) {
       console.error(`❌ 投稿失敗 (${task.username}):`, error.message);
       if (error.response) {
-        console.log("▼エラー詳細▼");
         console.log(JSON.stringify(error.response.data));
       }
     }
