@@ -19,17 +19,26 @@ app.post("/api/check", async (req, res) => {
 
   try {
     const proxyAgent = new HttpsProxyAgent(PROXY_URL);
+    
+    // ヘッダーを準備
+    const headers = {};
+    if (csrftoken) {
+      headers['x-csrftoken'] = csrftoken;
+      // Cookieにcsrftokenを追加（sessionidはライブラリが自動でtokenからセットします）
+      headers['Cookie'] = `csrftoken=${csrftoken}`;
+    }
+
     const threadsAPI = new ThreadsAPI({
       username: username,
       token: token, 
-      deviceID: deviceId, // 本物のデバイスIDを使う
-      axiosConfig: { httpAgent: proxyAgent, httpsAgent: proxyAgent },
+      deviceID: deviceId,
+      // ★修正: ここでヘッダーを渡す
+      axiosConfig: { 
+        httpAgent: proxyAgent, 
+        httpsAgent: proxyAgent,
+        headers: headers 
+      },
     });
-
-    // CSRFトークンを強制注入
-    if (csrftoken) {
-      threadsAPI.axios.defaults.headers.common['x-csrftoken'] = csrftoken;
-    }
 
     const userID = await threadsAPI.getUserIDfromUsername(username);
     res.json({ status: "success", message: `Cookieログイン成功！UserID: ${userID}` });
@@ -61,20 +70,24 @@ async function processQueue() {
     try {
       const proxyAgent = new HttpsProxyAgent(PROXY_URL);
       
+      // ヘッダーを準備
+      const headers = {};
+      if (task.csrftoken) {
+        headers['x-csrftoken'] = task.csrftoken;
+        headers['Cookie'] = `csrftoken=${task.csrftoken}`;
+      }
+
+      // ★修正: ここでヘッダーを渡す
       const threadsAPI = new ThreadsAPI({
         username: task.username,
         token: task.token, 
         deviceID: task.deviceId,
-        axiosConfig: { httpAgent: proxyAgent, httpsAgent: proxyAgent },
+        axiosConfig: { 
+          httpAgent: proxyAgent, 
+          httpsAgent: proxyAgent,
+          headers: headers 
+        },
       });
-
-      // ★書き込み許可証（CSRF）をセット★
-      if (task.csrftoken) {
-        threadsAPI.axios.defaults.headers.common['x-csrftoken'] = task.csrftoken;
-        // Cookieにも念のため追加
-        const currentCookie = threadsAPI.axios.defaults.headers.common['Cookie'] || "";
-        threadsAPI.axios.defaults.headers.common['Cookie'] = `${currentCookie}; csrftoken=${task.csrftoken}`;
-      }
 
       await threadsAPI.publish({ text: task.text, image: task.imageUrl });
       console.log(`✅ 投稿成功: ${task.username}`);
