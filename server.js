@@ -5,12 +5,10 @@ const app = express();
 
 app.use(express.json());
 
-// ▼▼▼ プロキシ設定はGASから受け取るため削除済み ▼▼▼
-
 const requestQueue = [];
 let isProcessing = false;
 
-// 1. ログイン確認
+// 1. 厳密なログイン確認
 app.post("/api/check", async (req, res) => {
   const { username, fullCookie, deviceId, ua, proxy } = req.body;
   console.log(`[Login Check] ${username}`);
@@ -22,27 +20,39 @@ app.post("/api/check", async (req, res) => {
   try {
     const proxyAgent = new HttpsProxyAgent(proxy);
     
-    // ★修正: GASから受け取った「完全なCookie」をそのままセットする
     const threadsAPI = new ThreadsAPI({
       username: username,
-      token: "dummy", // ライブラリの必須項目なのでダミーを入れる（実際はヘッダーで上書き）
+      token: "dummy",
       deviceID: deviceId,
       axiosConfig: { 
         httpAgent: proxyAgent, 
         httpsAgent: proxyAgent,
         headers: {
-          'Cookie': fullCookie, // ★ここでADSPOWERの全Cookieを渡す
+          'Cookie': fullCookie,
           'User-Agent': ua
         }
       },
     });
 
+    // ① まずユーザーIDを取得
     const userID = await threadsAPI.getUserIDfromUsername(username);
-    res.json({ status: "success", message: `完全ログイン成功！ UserID: ${userID}` });
+    
+    // ② 【ここが追加】 実際にプロフィール情報を取得して、アクセス権があるかテストする
+    // Cookieが無効、またはIPが不一致なら、ここで「403エラー」が出るはずです
+    await threadsAPI.getUserProfile(userID);
+
+    res.json({ status: "success", message: `★ログイン状態よし！ UserID: ${userID}` });
 
   } catch (error) {
     console.error(`[Login Check] 失敗: ${error.message}`);
-    if (error.response) console.log(JSON.stringify(error.response.data));
+    // エラー詳細があればログに出す
+    if (error.response) {
+      console.log(JSON.stringify(error.response.data));
+      // 403 Forbidden なら明確に伝える
+      if (error.response.status === 403 || error.message.includes("Login")) {
+        return res.status(403).json({ status: "error", message: "【重要】Cookieが無効、またはプロキシIPが一致していません。強制ログアウトされています。" });
+      }
+    }
     res.status(500).json({ status: "error", message: error.message });
   }
 });
@@ -76,7 +86,7 @@ async function processQueue() {
           httpAgent: proxyAgent, 
           httpsAgent: proxyAgent,
           headers: {
-            'Cookie': task.fullCookie, // ★完全なCookieを使用
+            'Cookie': task.fullCookie,
             'User-Agent': task.ua
           }
         },
