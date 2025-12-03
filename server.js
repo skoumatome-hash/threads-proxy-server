@@ -1,7 +1,7 @@
 const express = require("express");
 const { HttpsProxyAgent } = require("https-proxy-agent");
 const axios = require("axios");
-const crypto = require("crypto"); // UUID生成用
+const crypto = require("crypto");
 const app = express();
 
 app.use(express.json());
@@ -16,8 +16,10 @@ function parseCookieInput(input) {
   let sessionid = null, userID = null, deviceId = null, csrftoken = null;
   let headerString = "";
   if (!input) return { sessionid, userID, deviceId, headerString };
+  
   const trimmed = input.trim();
 
+  // JSONの場合
   if (trimmed.startsWith("[") || trimmed.startsWith("{")) {
     try {
       const cookies = JSON.parse(trimmed);
@@ -34,6 +36,7 @@ function parseCookieInput(input) {
       }
     } catch (e) { console.error(e); }
   } else {
+    // 文字列の場合
     headerString = trimmed;
     const sessMatch = trimmed.match(/(^|;\s*)sessionid=([^;]*)/);
     if (sessMatch) sessionid = decodeURIComponent(sessMatch[1]);
@@ -45,6 +48,7 @@ function parseCookieInput(input) {
   return { sessionid, userID, deviceId, csrftoken, headerString };
 }
 
+// Cookieのマージ
 function mergeCookies(oldCookieString, setCookieHeader) {
   if (!setCookieHeader || !Array.isArray(setCookieHeader)) return oldCookieString;
   const cookieMap = new Map();
@@ -62,6 +66,7 @@ function mergeCookies(oldCookieString, setCookieHeader) {
   return parts.join('; ');
 }
 
+// プロキシ変換
 function formatProxy(proxyStr) {
   if (!proxyStr) return null;
   if (proxyStr.startsWith("http")) return proxyStr;
@@ -73,6 +78,7 @@ function formatProxy(proxyStr) {
   return proxyStr;
 }
 
+// ★重要: ブラウザ偽装ヘッダー (AJAX対応版)
 function createWebHeaders(ua, fullCookie, csrftoken, lsd = null) {
   const headers = {
     'User-Agent': ua,
@@ -90,6 +96,8 @@ function createWebHeaders(ua, fullCookie, csrftoken, lsd = null) {
     'Sec-Fetch-Dest': 'empty',
     'Sec-Fetch-Mode': 'cors',
     'Sec-Fetch-Site': 'same-origin',
+    'X-Requested-With': 'XMLHttpRequest', // ★これが足りなかった！
+    'X-Instagram-Ajax': '1'               // ★念のためこれも追加
   };
   if (lsd) headers['x-fb-lsd'] = lsd;
   return headers;
@@ -147,12 +155,13 @@ async function processQueue() {
       const formattedProxy = formatProxy(task.proxy);
       const proxyAgent = new HttpsProxyAgent(formattedProxy);
       
-      // 1. 初期Cookie解析
+      // 1. Cookie解析
       const { userID, headerString: initialCookie, csrftoken: initialCsrf } = parseCookieInput(task.fullCookie);
       
       // 2. LSD取得
-      console.log("LSDトークン取得中...");
+      console.log("LSD取得中...");
       let headers = createWebHeaders(task.ua, initialCookie, initialCsrf);
+      
       const pageRes = await axios.get(`https://www.threads.net/@${task.username}`, {
         httpsAgent: proxyAgent,
         headers: headers,
@@ -164,43 +173,44 @@ async function processQueue() {
       if (!lsd) throw new Error("LSD取得失敗");
       console.log(`LSD: ${lsd}`);
 
-      // Cookie更新
-      const setCookie = pageRes.headers['set-cookie'];
-      const updatedCookieString = mergeCookies(initialCookie, setCookie);
+      // Cookie更新 (Set-Cookieがあればマージ)
+      const updatedCookieString = mergeCookies(initialCookie, pageRes.headers['set-cookie']);
       
-      // 3. 投稿 (POST)
+      // 3. 投稿 (GraphQL)
       const postHeaders = createWebHeaders(task.ua, updatedCookieString, initialCsrf, lsd);
       postHeaders['x-fb-friendly-name'] = 'BarcelonaCreatePostMutation';
 
       const postPayload = new URLSearchParams();
       postPayload.append('lsd', lsd);
-      // ★ここが修正点！ client_mutation_id を追加！
       postPayload.append('variables', JSON.stringify({
         userID: userID,
         text: task.text,
         publicationOpt: "any_user",
         attachmentUtils: null,
-        client_mutation_id: crypto.randomUUID() // ★整理番号を付ける
+        client_mutation_id: crypto.randomUUID()
       }));
-      postPayload.append('doc_id', '23980155133315596');
+      
+      // ★Web用の最新doc_id
+      postPayload.append('doc_id', '7395668937167689'); 
 
-      await new Promise(r => setTimeout(r, 2000));
-
+      console.log("投稿リクエスト送信...");
       const postRes = await axios.post("https://www.threads.net/api/graphql", postPayload, {
         httpsAgent: proxyAgent,
         headers: postHeaders,
         proxy: false
       });
 
-      if (postRes.data?.data?.xfb_create_threads_post_content) {
+      // レスポンス確認
+      const data = postRes.data;
+      if (data.data && data.data.xfb_create_threads_post_content) {
          console.log(`✅ 投稿成功: ${task.username}`);
       } else {
-         // エラー詳細をログに出す
-         console.log("投稿レスポンス(失敗):", JSON.stringify(postRes.data).substring(0, 500));
+         console.log("投稿失敗 (レスポンス):", JSON.stringify(data).substring(0, 300));
       }
 
     } catch (error) {
       console.error(`❌ 投稿失敗 (${task.username}):`, error.message);
+      if (error.response) console.log(JSON.stringify(error.response.data).substring(0, 200));
     }
 
     if (requestQueue.length > 0) {
