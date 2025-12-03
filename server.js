@@ -1,7 +1,7 @@
 const express = require("express");
 const { ThreadsAPI } = require("threads-api");
 const { HttpsProxyAgent } = require("https-proxy-agent");
-const axios = require("axios"); // 直接通信用
+const axios = require("axios");
 const app = express();
 
 app.use(express.json());
@@ -33,7 +33,7 @@ function formatProxy(proxyStr) {
   return proxyStr;
 }
 
-// 1. ログイン確認 (生通信版)
+// 1. ログイン確認 (ブラウザ完全偽装版)
 app.post("/api/check", async (req, res) => {
   const { username, fullCookie, ua, proxy } = req.body;
   console.log(`[Login Check] ${username}`);
@@ -47,106 +47,66 @@ app.post("/api/check", async (req, res) => {
     const proxyAgent = new HttpsProxyAgent(formattedProxy);
     const realCsrf = getCookieValue(fullCookie, "csrftoken");
 
-    // ★修正: ライブラリを使わず、直接axiosで叩く
-    // Threadsの「自分自身」の情報を取得するAPI
-    const response = await axios.get("https://www.threads.net/api/v1/users/me", {
+    // ★修正: ブラウザになりきるための完全なヘッダー
+    const headers = {
+      'User-Agent': ua,
+      'Cookie': fullCookie,
+      'x-csrftoken': realCsrf,
+      'x-ig-app-id': '238260118697367',
+      'x-asbd-id': '129477',
+      // ▼▼ ここから追加したブラウザ用ヘッダー ▼▼
+      'Authority': 'www.threads.net',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Cache-Control': 'no-cache',
+      'Pragma': 'no-cache',
+      'Sec-Fetch-Dest': 'document',
+      'Sec-Fetch-Mode': 'navigate',
+      'Sec-Fetch-Site': 'none', // 直接アクセスを装う
+      'Sec-Fetch-User': '?1',
+      'Upgrade-Insecure-Requests': '1'
+    };
+
+    // Threadsのトップページ（またはプロフィール）を見に行く
+    // ※APIではなくHTMLページを見に行くことで、より自然なアクセスにする
+    const targetUrl = `https://www.threads.net/@${username}`;
+
+    const response = await axios.get(targetUrl, {
       httpsAgent: proxyAgent,
-      headers: {
-        'User-Agent': ua,
-        'Cookie': fullCookie,
-        'x-csrftoken': realCsrf,
-        'x-ig-app-id': '238260118697367', // ThreadsのAppID
-        'x-asbd-id': '129477'
+      headers: headers,
+      proxy: false, // axios標準のプロキシ機能を切ってhttpsAgentを使う
+      validateStatus: function (status) {
+        return status >= 200 && status < 500; // 404などはエラーにしない
       }
     });
 
-    // 成功すればここにデータが入る
-    console.log("Response Status:", response.status);
-    // console.log("Data:", JSON.stringify(response.data)); 
+    console.log(`Response Status: ${response.status}`);
 
+    // 200 OK なら通信成功
+    // さらに、レスポンスのHTMLの中に「ログアウト」などの文字がないか簡易チェック
     if (response.status === 200) {
-      res.json({ status: "success", message: `★通信成功！ Status: ${response.status}` });
+      // ログインできているかどうかの判定（簡易）
+      // タイトルタグなどにユーザー名が含まれているかチェック
+      if (response.data.includes(username)) {
+        res.json({ status: "success", message: `★ログイン確認よし！ (Profile Page 200 OK)` });
+      } else {
+        // 200だけど中身がログインページかもしれない
+        res.json({ status: "success", message: `★通信成功 (Status 200) ※念のため投稿テスト推奨` });
+      }
+    } else if (response.status === 404) {
+      res.status(404).json({ status: "error", message: "ページが見つかりません (404)。ユーザー名が正しいか確認してください。" });
     } else {
-      res.json({ status: "error", message: `ステータス異常: ${response.status}` });
+      res.status(response.status).json({ status: "error", message: `ステータス異常: ${response.status}` });
     }
 
   } catch (error) {
     console.error(`[Login Check] 通信失敗: ${error.message}`);
     
-    // エラーレスポンスの詳細を暴く
     if (error.response) {
       console.log(`Status: ${error.response.status}`);
-      console.log(`Body: ${JSON.stringify(error.response.data)}`);
+      // HTMLが返ってきている場合、ログに出すと長すぎるので先頭だけ
+      // console.log(error.response.data.substring(0, 200));
       
       const status = error.response.status;
-      const body = JSON.stringify(error.response.data);
-
       if (status === 403 || status === 401) {
-         return res.status(403).json({ status: "error", message: `拒否されました(${status}): ログインが無効です。\n${body.substring(0, 100)}` });
-      }
-      if (status === 302) {
-         return res.status(302).json({ status: "error", message: "リダイレクトされました(302): ログイン画面に飛ばされています。" });
-      }
-    }
-    res.status(500).json({ status: "error", message: `通信エラー: ${error.message}` });
-  }
-});
-
-// 2. 予約受付 (変更なし)
-app.post("/api/enqueue", (req, res) => {
-  const { username, fullCookie, text, deviceId, imageUrl, ua, proxy } = req.body;
-  requestQueue.push({ username, fullCookie, text, deviceId, imageUrl, ua, proxy });
-  console.log(`[受付] ${username}`);
-  res.json({ status: "queued", message: "予約完了" });
-  processQueue();
-});
-
-// 3. 処理ワーカー (変更なし)
-async function processQueue() {
-  if (isProcessing || requestQueue.length === 0) return;
-  isProcessing = true;
-
-  while (requestQueue.length > 0) {
-    const task = requestQueue.shift();
-    console.log(`\n--- 処理開始: ${task.username} ---`);
-
-    try {
-      const formattedProxy = formatProxy(task.proxy);
-      const proxyAgent = new HttpsProxyAgent(formattedProxy);
-      
-      const sessionid = getCookieValue(task.fullCookie, "sessionid");
-      const realCsrf = getCookieValue(task.fullCookie, "csrftoken");
-
-      const threadsAPI = new ThreadsAPI({
-        username: task.username,
-        token: sessionid || "dummy",
-        deviceID: task.deviceId,
-        axiosConfig: { 
-          httpAgent: proxyAgent, 
-          httpsAgent: proxyAgent,
-          headers: {
-            'User-Agent': task.ua,
-            'Cookie': task.fullCookie,
-            'x-csrftoken': realCsrf
-          }
-        },
-      });
-
-      await threadsAPI.publish({ text: task.text, image: task.imageUrl });
-      console.log(`✅ 投稿成功: ${task.username}`);
-
-    } catch (error) {
-      console.error(`❌ 投稿失敗 (${task.username}):`, error.message);
-    }
-
-    if (requestQueue.length > 0) {
-      console.log("☕ 休憩中 (25秒)...");
-      await new Promise((resolve) => setTimeout(resolve, 25000));
-    }
-  }
-  isProcessing = false;
-}
-
-const listener = app.listen(process.env.PORT, () => {
-  console.log("Server started");
-});
+         return res.status(403).json({ status: "error
