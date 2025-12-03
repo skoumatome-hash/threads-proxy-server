@@ -14,7 +14,7 @@ let isProcessing = false;
 
 // 1. ログイン確認用
 app.post("/api/check", async (req, res) => {
-  const { username, token, deviceId } = req.body;
+  const { username, token, deviceId, csrftoken } = req.body;
   console.log(`[Login Check] ${username}`);
 
   try {
@@ -22,9 +22,14 @@ app.post("/api/check", async (req, res) => {
     const threadsAPI = new ThreadsAPI({
       username: username,
       token: token, 
-      deviceID: deviceId,
+      deviceID: deviceId, // 本物のデバイスIDを使う
       axiosConfig: { httpAgent: proxyAgent, httpsAgent: proxyAgent },
     });
+
+    // CSRFトークンを強制注入
+    if (csrftoken) {
+      threadsAPI.axios.defaults.headers.common['x-csrftoken'] = csrftoken;
+    }
 
     const userID = await threadsAPI.getUserIDfromUsername(username);
     res.json({ status: "success", message: `Cookieログイン成功！UserID: ${userID}` });
@@ -37,8 +42,8 @@ app.post("/api/check", async (req, res) => {
 
 // 2. 予約受付
 app.post("/api/enqueue", (req, res) => {
-  const { username, token, text, deviceId, imageUrl } = req.body;
-  requestQueue.push({ username, token, text, deviceId, imageUrl });
+  const { username, token, text, deviceId, imageUrl, csrftoken } = req.body;
+  requestQueue.push({ username, token, text, deviceId, imageUrl, csrftoken });
   console.log(`[受付] ${username} を予約`);
   res.json({ status: "queued", message: "予約完了" });
   processQueue();
@@ -63,17 +68,21 @@ async function processQueue() {
         axiosConfig: { httpAgent: proxyAgent, httpsAgent: proxyAgent },
       });
 
+      // ★書き込み許可証（CSRF）をセット★
+      if (task.csrftoken) {
+        threadsAPI.axios.defaults.headers.common['x-csrftoken'] = task.csrftoken;
+        // Cookieにも念のため追加
+        const currentCookie = threadsAPI.axios.defaults.headers.common['Cookie'] || "";
+        threadsAPI.axios.defaults.headers.common['Cookie'] = `${currentCookie}; csrftoken=${task.csrftoken}`;
+      }
+
       await threadsAPI.publish({ text: task.text, image: task.imageUrl });
       console.log(`✅ 投稿成功: ${task.username}`);
 
     } catch (error) {
       console.error(`❌ 投稿失敗 (${task.username}):`, error.message);
-      
-      // ★★★ エラーの正体を暴くログを追加 ★★★
       if (error.response) {
-        console.log("▼▼▼ エラー詳細 (ここを教えて！) ▼▼▼");
-        console.log(JSON.stringify(error.response.data, null, 2));
-        console.log("▲▲▲ エラー詳細 ここまで ▲▲▲");
+        console.log(JSON.stringify(error.response.data));
       }
     }
 
