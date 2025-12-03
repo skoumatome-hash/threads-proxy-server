@@ -5,7 +5,7 @@ const app = express();
 
 app.use(express.json());
 
-// ▼▼▼ プロキシ設定（変更なし） ▼▼▼
+// ▼▼▼ プロキシ設定 ▼▼▼
 const PROXY_URL = 'http://86a4c5a5d75ab064cd33__cr.jp:ae68af898d6ead3b@gw.dataimpulse.com:823';
 // ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
 
@@ -15,12 +15,12 @@ let isProcessing = false;
 // 1. ログイン確認用
 app.post("/api/check", async (req, res) => {
   const { username, token, deviceId } = req.body;
-  console.log(`[Login Check] ${username} (Token Login)`);
+  console.log(`[Login Check] ${username}`);
 
   try {
     const proxyAgent = new HttpsProxyAgent(PROXY_URL);
     const threadsAPI = new ThreadsAPI({
-      username: username, // ここは username でOK
+      username: username,
       token: token, 
       deviceID: deviceId,
       axiosConfig: { httpAgent: proxyAgent, httpsAgent: proxyAgent },
@@ -39,7 +39,7 @@ app.post("/api/check", async (req, res) => {
 app.post("/api/enqueue", (req, res) => {
   const { username, token, text, deviceId, imageUrl } = req.body;
   requestQueue.push({ username, token, text, deviceId, imageUrl });
-  console.log(`[受付] ${username} を予約 (Token使用)`);
+  console.log(`[受付] ${username} を予約`);
   res.json({ status: "queued", message: "予約完了" });
   processQueue();
 });
@@ -56,9 +56,8 @@ async function processQueue() {
     try {
       const proxyAgent = new HttpsProxyAgent(PROXY_URL);
       
-      // ★修正ポイント： task.username を渡すように明記しました
       const threadsAPI = new ThreadsAPI({
-        username: task.username, // ★ここが重要！
+        username: task.username,
         token: task.token, 
         deviceID: task.deviceId,
         axiosConfig: { httpAgent: proxyAgent, httpsAgent: proxyAgent },
@@ -68,8 +67,14 @@ async function processQueue() {
       console.log(`✅ 投稿成功: ${task.username}`);
 
     } catch (error) {
-      // エラーログも task.username を使うように修正
       console.error(`❌ 投稿失敗 (${task.username}):`, error.message);
+      
+      // ★★★ エラーの正体を暴くログを追加 ★★★
+      if (error.response) {
+        console.log("▼▼▼ エラー詳細 (ここを教えて！) ▼▼▼");
+        console.log(JSON.stringify(error.response.data, null, 2));
+        console.log("▲▲▲ エラー詳細 ここまで ▲▲▲");
+      }
     }
 
     if (requestQueue.length > 0) {
