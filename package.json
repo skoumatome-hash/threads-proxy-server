@@ -1,15 +1,13 @@
 {
-  "name": "threads-server",
+  "name": "threads-puppeteer-server",
   "version": "1.0.0",
-  "description": "Threads Proxy Server",
+  "description": "Threads Puppeteer Server",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "express": "^4.18.2",
-    "threads-api": "^1.0.0",
-    "https-proxy-agent": "^7.0.0",
-    "otpauth": "^9.1.2"
+    "express": "^4.19.2",
+    "puppeteer": "^22.6.0"
   }
 }
