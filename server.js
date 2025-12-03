@@ -19,7 +19,6 @@ function parseCookieInput(input) {
   
   const trimmed = input.trim();
 
-  // JSONの場合
   if (trimmed.startsWith("[") || trimmed.startsWith("{")) {
     try {
       const cookies = JSON.parse(trimmed);
@@ -36,7 +35,6 @@ function parseCookieInput(input) {
       }
     } catch (e) { console.error(e); }
   } else {
-    // 文字列の場合
     headerString = trimmed;
     const sessMatch = trimmed.match(/(^|;\s*)sessionid=([^;]*)/);
     if (sessMatch) sessionid = decodeURIComponent(sessMatch[1]);
@@ -48,7 +46,7 @@ function parseCookieInput(input) {
   return { sessionid, userID, deviceId, csrftoken, headerString };
 }
 
-// Cookieのマージ
+// Cookie更新用
 function mergeCookies(oldCookieString, setCookieHeader) {
   if (!setCookieHeader || !Array.isArray(setCookieHeader)) return oldCookieString;
   const cookieMap = new Map();
@@ -66,7 +64,11 @@ function mergeCookies(oldCookieString, setCookieHeader) {
   return parts.join('; ');
 }
 
-// プロキシ変換
+function extractValueFromCookieString(cookieString, key) {
+  const match = cookieString.match(new RegExp('(^|;\\s*)' + key + '=([^;]*)'));
+  return match ? match[2] : null;
+}
+
 function formatProxy(proxyStr) {
   if (!proxyStr) return null;
   if (proxyStr.startsWith("http")) return proxyStr;
@@ -78,7 +80,7 @@ function formatProxy(proxyStr) {
   return proxyStr;
 }
 
-// ★重要: ブラウザ偽装ヘッダー (AJAX対応版)
+// ★修正: AJAXヘッダーを復活させた完全版
 function createWebHeaders(ua, fullCookie, csrftoken, lsd = null) {
   const headers = {
     'User-Agent': ua,
@@ -96,9 +98,10 @@ function createWebHeaders(ua, fullCookie, csrftoken, lsd = null) {
     'Sec-Fetch-Dest': 'empty',
     'Sec-Fetch-Mode': 'cors',
     'Sec-Fetch-Site': 'same-origin',
-    'X-Requested-With': 'XMLHttpRequest', // ★これが足りなかった！
-    'X-Instagram-Ajax': '1'               // ★念のためこれも追加
+    'X-Requested-With': 'XMLHttpRequest', // ★これがナイトHTMLが返ってくる！
+    'X-Instagram-Ajax': '1'
   };
+  
   if (lsd) headers['x-fb-lsd'] = lsd;
   return headers;
 }
@@ -114,7 +117,9 @@ app.post("/api/check", async (req, res) => {
     const proxyAgent = new HttpsProxyAgent(formattedProxy);
     const { userID, headerString, csrftoken } = parseCookieInput(fullCookie);
     
+    // チェック時はGETなので最低限のヘッダーでOK
     const headers = createWebHeaders(ua, headerString, csrftoken);
+    
     const response = await axios.get(`https://www.threads.net/@${username}`, {
       httpsAgent: proxyAgent,
       headers: headers,
@@ -155,13 +160,11 @@ async function processQueue() {
       const formattedProxy = formatProxy(task.proxy);
       const proxyAgent = new HttpsProxyAgent(formattedProxy);
       
-      // 1. Cookie解析
       const { userID, headerString: initialCookie, csrftoken: initialCsrf } = parseCookieInput(task.fullCookie);
       
-      // 2. LSD取得
+      // 1. LSD取得
       console.log("LSD取得中...");
       let headers = createWebHeaders(task.ua, initialCookie, initialCsrf);
-      
       const pageRes = await axios.get(`https://www.threads.net/@${task.username}`, {
         httpsAgent: proxyAgent,
         headers: headers,
@@ -170,14 +173,16 @@ async function processQueue() {
 
       const lsdMatch = pageRes.data.match(/"LSD",\[\],{"token":"(.*?)"}/);
       const lsd = lsdMatch ? lsdMatch[1] : null;
+      
       if (!lsd) throw new Error("LSD取得失敗");
       console.log(`LSD: ${lsd}`);
 
-      // Cookie更新 (Set-Cookieがあればマージ)
+      // Cookie更新 (継承)
       const updatedCookieString = mergeCookies(initialCookie, pageRes.headers['set-cookie']);
-      
-      // 3. 投稿 (GraphQL)
-      const postHeaders = createWebHeaders(task.ua, updatedCookieString, initialCsrf, lsd);
+      const updatedCsrf = extractValueFromCookieString(updatedCookieString, "csrftoken") || initialCsrf;
+
+      // 2. 投稿 (GraphQL) - ★ここにAJAXヘッダーが入る！
+      const postHeaders = createWebHeaders(task.ua, updatedCookieString, updatedCsrf, lsd);
       postHeaders['x-fb-friendly-name'] = 'BarcelonaCreatePostMutation';
 
       const postPayload = new URLSearchParams();
@@ -189,9 +194,7 @@ async function processQueue() {
         attachmentUtils: null,
         client_mutation_id: crypto.randomUUID()
       }));
-      
-      // ★Web用の最新doc_id
-      postPayload.append('doc_id', '7395668937167689'); 
+      postPayload.append('doc_id', '23980155133315596');
 
       console.log("投稿リクエスト送信...");
       const postRes = await axios.post("https://www.threads.net/api/graphql", postPayload, {
@@ -200,17 +203,18 @@ async function processQueue() {
         proxy: false
       });
 
-      // レスポンス確認
-      const data = postRes.data;
-      if (data.data && data.data.xfb_create_threads_post_content) {
+      // 成功判定
+      if (postRes.data?.data?.xfb_create_threads_post_content) {
          console.log(`✅ 投稿成功: ${task.username}`);
       } else {
-         console.log("投稿失敗 (レスポンス):", JSON.stringify(data).substring(0, 300));
+         console.log("投稿失敗(レスポンス):", JSON.stringify(postRes.data));
       }
 
     } catch (error) {
       console.error(`❌ 投稿失敗 (${task.username}):`, error.message);
-      if (error.response) console.log(JSON.stringify(error.response.data).substring(0, 200));
+      if (error.response) {
+         console.log("Error Data:", JSON.stringify(error.response.data).substring(0, 300));
+      }
     }
 
     if (requestQueue.length > 0) {
