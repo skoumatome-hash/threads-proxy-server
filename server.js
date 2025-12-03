@@ -63,7 +63,6 @@ app.post("/api/check", async (req, res) => {
   if (!proxy || !fullCookie) return res.status(400).json({ status: "error", message: "情報不足" });
 
   try {
-    // 生通信でチェック (ライブラリのバグ回避)
     const formattedProxy = formatProxy(proxy);
     const proxyAgent = new HttpsProxyAgent(formattedProxy);
     const realCsrf = getCookieValue(fullCookie, "csrftoken");
@@ -91,7 +90,6 @@ app.post("/api/check", async (req, res) => {
 
 // 2. 予約受付
 app.post("/api/enqueue", (req, res) => {
-  // 必要な情報を全部受け取ってキューに入れる
   const { username, fullCookie, text, deviceId, imageUrl, ua, proxy } = req.body;
   requestQueue.push({ username, fullCookie, text, deviceId, imageUrl, ua, proxy });
   console.log(`[受付] ${username} を予約`);
@@ -99,7 +97,7 @@ app.post("/api/enqueue", (req, res) => {
   processQueue();
 });
 
-// 3. 処理ワーカー (ログイン → 即投稿)
+// 3. 処理ワーカー (修正済み)
 async function processQueue() {
   if (isProcessing || requestQueue.length === 0) return;
   isProcessing = true;
@@ -116,28 +114,22 @@ async function processQueue() {
       const realCsrf = getCookieValue(task.fullCookie, "csrftoken");
       const realDeviceId = getCookieValue(task.fullCookie, "ig_did") || task.deviceId;
 
-      // 1. クライアント作成
+      // ヘッダーを準備
+      const browserHeaders = createBrowserHeaders(task.ua, task.fullCookie, realCsrf);
+
+      // クライアント作成
+      // ★修正: interceptorsを使わず、ここでheadersを渡す
       const threadsAPI = new ThreadsAPI({
         username: task.username,
         token: sessionid,
         deviceID: realDeviceId,
-        // ここでの設定は初期値として渡す
         axiosConfig: { 
           httpAgent: proxyAgent, 
           httpsAgent: proxyAgent,
+          headers: browserHeaders // ★ここで最強ヘッダーを注入
         },
       });
 
-      // ★重要: ライブラリが勝手にヘッダーを変えないよう、送信直前に「検問」で書き換える
-      const browserHeaders = createBrowserHeaders(task.ua, task.fullCookie, realCsrf);
-      
-      threadsAPI.axios.interceptors.request.use(config => {
-        // ヘッダーを強制上書き
-        Object.assign(config.headers, browserHeaders);
-        return config;
-      });
-
-      // 2. 「ログインした状態」で投稿を実行
       console.log("投稿リクエスト送信...");
       await threadsAPI.publish({ text: task.text, image: task.imageUrl });
       
@@ -150,7 +142,6 @@ async function processQueue() {
       }
     }
 
-    // 休憩 (IPローテ対策)
     if (requestQueue.length > 0) {
       console.log("☕ 休憩中 (25秒)...");
       await new Promise((resolve) => setTimeout(resolve, 25000));
