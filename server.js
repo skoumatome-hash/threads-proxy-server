@@ -5,22 +5,22 @@ const app = express();
 
 app.use(express.json());
 
-// ▼▼▼ プロキシ設定 ▼▼▼
-const PROXY_URL = 'http://86a4c5a5d75ab064cd33__cr.jp:ae68af898d6ead3b@gw.dataimpulse.com:823';
-// ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
+// ★固定のプロキシ設定は削除しました（GASから受け取るため）
 
 const requestQueue = [];
 let isProcessing = false;
 
-// 1. ログイン確認用
+// 1. ログイン確認（本当のログインチェックを行うように修正）
 app.post("/api/check", async (req, res) => {
-  const { username, token, deviceId, csrftoken, ua } = req.body;
+  const { username, token, deviceId, csrftoken, ua, proxy } = req.body;
   console.log(`[Login Check] ${username}`);
 
+  if (!proxy) {
+    return res.status(400).json({ status: "error", message: "プロキシ情報がありません" });
+  }
+
   try {
-    const proxyAgent = new HttpsProxyAgent(PROXY_URL);
-    
-    // Cookieを合体
+    const proxyAgent = new HttpsProxyAgent(proxy); // ★GASからのプロキシを使う
     const cookieString = `sessionid=${token}; csrftoken=${csrftoken}`;
 
     const threadsAPI = new ThreadsAPI({
@@ -33,24 +33,36 @@ app.post("/api/check", async (req, res) => {
         headers: {
           'x-csrftoken': csrftoken,
           'Cookie': cookieString,
-          'User-Agent': ua // ★ここが重要！ADSPOWERの顔をする
+          'User-Agent': ua
         }
       },
     });
 
-    const userID = await threadsAPI.getUserIDfromUsername(username);
-    res.json({ status: "success", message: `Cookieログイン成功！UserID: ${userID}` });
+    // ★修正：本当にログインできているか、自分の情報を取得してテストする
+    const currentUser = await threadsAPI.getCurrentUser();
+    // もしログインできていなければ、ここでエラーになるはず
+    
+    res.json({ status: "success", message: `完全ログイン成功！ User: ${currentUser.username}` });
 
   } catch (error) {
     console.error(`[Login Check] 失敗: ${error.message}`);
-    res.status(500).json({ status: "error", message: error.message });
+    // エラー詳細があればログに出す
+    if (error.response) console.log(JSON.stringify(error.response.data));
+    
+    res.status(500).json({ status: "error", message: "ログイン失敗（Cookieまたはプロキシが不一致）" });
   }
 });
 
 // 2. 予約受付
 app.post("/api/enqueue", (req, res) => {
-  const { username, token, text, deviceId, imageUrl, csrftoken, ua } = req.body;
-  requestQueue.push({ username, token, text, deviceId, imageUrl, csrftoken, ua });
+  // proxy を受け取るように追加
+  const { username, token, text, deviceId, imageUrl, csrftoken, ua, proxy } = req.body;
+  
+  if (!proxy) {
+    return res.status(400).json({ status: "error", message: "プロキシ情報(L列)が不足しています" });
+  }
+
+  requestQueue.push({ username, token, text, deviceId, imageUrl, csrftoken, ua, proxy });
   console.log(`[受付] ${username} を予約`);
   res.json({ status: "queued", message: "予約完了" });
   processQueue();
@@ -66,7 +78,8 @@ async function processQueue() {
     console.log(`\n--- 処理開始: ${task.username} ---`);
 
     try {
-      const proxyAgent = new HttpsProxyAgent(PROXY_URL);
+      // ★タスクごとのプロキシを使用
+      const proxyAgent = new HttpsProxyAgent(task.proxy);
       const cookieString = `sessionid=${task.token}; csrftoken=${task.csrftoken}`;
 
       const threadsAPI = new ThreadsAPI({
@@ -79,7 +92,7 @@ async function processQueue() {
           headers: {
             'x-csrftoken': task.csrftoken,
             'Cookie': cookieString,
-            'User-Agent': task.ua // ★ワーカー側もUAを設定
+            'User-Agent': task.ua
           }
         },
       });
@@ -90,6 +103,7 @@ async function processQueue() {
     } catch (error) {
       console.error(`❌ 投稿失敗 (${task.username}):`, error.message);
       if (error.response) {
+        console.log("▼エラー詳細▼");
         console.log(JSON.stringify(error.response.data));
       }
     }
