@@ -9,17 +9,60 @@ const requestQueue = [];
 let isProcessing = false;
 
 // ---------------------------------------------------------
-//  Cookie文字列から値を抜き出す関数
+//  ★万能Cookie解析関数 (JSONでも文字列でも対応)
 // ---------------------------------------------------------
-function getCookieValue(cookieString, key) {
-  if (!cookieString) return null;
-  const match = cookieString.match(new RegExp('(^|;\\s*)' + key + '=([^;]*)'));
-  if (match && match[2]) return decodeURIComponent(match[2]);
-  return null;
+function parseCookieInput(input) {
+  let sessionid = null;
+  let userID = null;
+  let deviceId = null;
+  let headerString = "";
+
+  if (!input) return { sessionid, userID, deviceId, headerString };
+
+  const trimmed = input.trim();
+
+  // A. JSON形式の場合 ([...])
+  if (trimmed.startsWith("[") || trimmed.startsWith("{")) {
+    try {
+      const cookies = JSON.parse(trimmed);
+      const cookieParts = [];
+      
+      if (Array.isArray(cookies)) {
+        cookies.forEach(c => {
+          // 値を抽出
+          if (c.name === "sessionid") sessionid = decodeURIComponent(c.value);
+          if (c.name === "ds_user_id") userID = c.value;
+          if (c.name === "ig_did") deviceId = c.value;
+          
+          // ヘッダー用に整形
+          cookieParts.push(`${c.name}=${c.value}`);
+        });
+        headerString = cookieParts.join("; ");
+      }
+    } catch (e) {
+      console.error("JSON解析エラー:", e.message);
+    }
+  } 
+  // B. 文字列形式の場合 (key=value; ...)
+  else {
+    headerString = trimmed; // そのまま使う
+    
+    // Regexで抽出
+    const sessionMatch = trimmed.match(/(^|;\s*)sessionid=([^;]*)/);
+    if (sessionMatch && sessionMatch[2]) sessionid = decodeURIComponent(sessionMatch[2]);
+
+    const userMatch = trimmed.match(/(^|;\s*)ds_user_id=([^;]*)/);
+    if (userMatch && userMatch[2]) userID = userMatch[2];
+
+    const didMatch = trimmed.match(/(^|;\s*)ig_did=([^;]*)/);
+    if (didMatch && didMatch[2]) deviceId = didMatch[2];
+  }
+
+  return { sessionid, userID, deviceId, headerString };
 }
 
 // ---------------------------------------------------------
-//  プロキシ形式変換 (host:port:user:pass -> http://...)
+//  プロキシ形式変換
 // ---------------------------------------------------------
 function formatProxy(proxyStr) {
   if (!proxyStr) return null;
@@ -40,16 +83,25 @@ app.post("/api/check", async (req, res) => {
   if (!proxy || !fullCookie) return res.status(400).json({ status: "error", message: "情報不足" });
 
   try {
-    // CookieからIDとセッションを抜く
-    const sessionid = getCookieValue(fullCookie, "sessionid");
-    const userID = getCookieValue(fullCookie, "ds_user_id");
+    // ★ここで万能解析！
+    const { sessionid, userID, headerString } = parseCookieInput(fullCookie);
 
     if (!sessionid || !userID) {
       return res.status(400).json({ status: "error", message: "Cookieからsessionidまたはds_user_idが見つかりません" });
     }
 
-    // ★セッションIDが生きていれば、これだけで十分
-    res.json({ status: "success", message: `★ID抽出OK: ${userID}\n(セッションID: ${sessionid.substring(0,5)}...)` });
+    // ID一致チェック
+    // ADSPOWERのCookieに入っているIDと、G2セルのIDが違っていたら警告
+    // (これがズレていると403になります)
+    /* if (userID !== username && !username.includes(userID)) {
+       console.warn(`警告: スプシのID(${username})とCookieのID(${userID})が不一致`);
+    }
+    */
+
+    res.json({ 
+      status: "success", 
+      message: `★解析OK: UserID=${userID}\n(Session: ${sessionid.substring(0,5)}...)` 
+    });
 
   } catch (error) {
     console.error(`[Login Check] エラー: ${error.message}`);
@@ -79,27 +131,27 @@ async function processQueue() {
       const formattedProxy = formatProxy(task.proxy);
       const proxyAgent = new HttpsProxyAgent(formattedProxy);
       
-      // 必要な情報を抽出
-      const sessionid = getCookieValue(task.fullCookie, "sessionid");
-      const userID = getCookieValue(task.fullCookie, "ds_user_id");
-      const ig_did = getCookieValue(task.fullCookie, "ig_did") || task.deviceId;
+      // ★ここでも万能解析
+      const { sessionid, deviceId, headerString } = parseCookieInput(task.fullCookie);
+      
+      // I2にJSONが入っていた場合、task.deviceIdよりCookie内のig_didを優先
+      const finalDeviceId = deviceId || task.deviceId;
 
       // ★ここが重要：ライブラリを「認証済み状態」で起動する
       const threadsAPI = new ThreadsAPI({
         username: task.username,
-        token: sessionid,  // ★本物のセッションIDを渡す！
-        deviceID: ig_did,  // ★本物のデバイスIDを渡す！
+        token: sessionid,  // ★本物のセッションID
+        deviceID: finalDeviceId,  // ★本物のデバイスID
         axiosConfig: { 
           httpAgent: proxyAgent, 
           httpsAgent: proxyAgent,
           headers: {
             'User-Agent': task.ua,     // ★ADSPOWERのUA
-            'Cookie': task.fullCookie  // ★念のため全Cookieも渡す
+            'Cookie': headerString     // ★整形済みのCookie文字列
           }
         },
       });
 
-      // ★余計なチェック(getUserProfile等)は一切せず、いきなり投稿する！
       console.log("投稿リクエスト送信...");
       await threadsAPI.publish({ text: task.text, image: task.imageUrl });
       
@@ -107,9 +159,7 @@ async function processQueue() {
 
     } catch (error) {
       console.error(`❌ 投稿失敗 (${task.username}):`, error.message);
-      // 詳細ログ
       if (error.response) {
-        console.log("--- Error Response ---");
         console.log(JSON.stringify(error.response.data));
       }
     }
